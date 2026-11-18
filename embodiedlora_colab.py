@@ -115,6 +115,7 @@ VALIDATION_SEEDS = tuple(range(900, 910))
 VALIDATION_STEPS = 200
 ADR_INTERVAL = 60
 ADR_MARGIN_DB = 10.0
+NO_ADR_ACTION = (12, 1, 60)
 
 
 def energy_mwh(current_ma, seconds):
@@ -951,16 +952,15 @@ def print_report(
         print_summary(name, aggregate(results))
 
     learned_summary = aggregate(learned_results)
-    best_name = next(
-        name for name in baseline_results
-        if name.startswith("Best validated fixed")
+    adr_summary = aggregate(
+        baseline_results["Standard LoRaWAN ADR-style"]
     )
-    best_summary = aggregate(baseline_results[best_name])
+    no_adr_summary = aggregate(
+        baseline_results["LoRaWAN without ADR"]
+    )
     learned_pdr = learned_summary["pdr"]
     learned_active = learned_summary["active_energy_mah"]
     learned_hourly = learned_summary["total_energy_per_hour"]
-    best_active = best_summary["active_energy_mah"]
-    best_hourly = best_summary["total_energy_per_hour"]
     pdr_pass = learned_pdr[0] >= PDR_TARGET
     print("\nIndependent-test checks:")
     print(
@@ -979,20 +979,20 @@ def print_report(
         f"(95% CI +/- {learned_hourly[2]:.6f})"
     )
     print(
-        f"  Compared with best validated fixed: "
-        f"active energy {((learned_active[0] / best_active[0]) - 1) * 100:+.1f}%, "
-        f"total/hour {((learned_hourly[0] / best_hourly[0]) - 1) * 100:+.1f}%"
-    )
-    adr_summary = aggregate(
-        baseline_results["Standard LoRaWAN ADR-style"]
-    )
-    print(
         f"  Compared with Standard LoRaWAN ADR-style: "
         f"PDR {learned_pdr[0] - adr_summary['pdr'][0]:+.3f}, "
         f"active energy "
         f"{((learned_active[0] / adr_summary['active_energy_mah'][0]) - 1) * 100:+.1f}%, "
         f"total/hour "
         f"{((learned_hourly[0] / adr_summary['total_energy_per_hour'][0]) - 1) * 100:+.1f}%"
+    )
+    print(
+        f"  Compared with LoRaWAN without ADR: "
+        f"PDR {learned_pdr[0] - no_adr_summary['pdr'][0]:+.3f}, "
+        f"active energy "
+        f"{((learned_active[0] / no_adr_summary['active_energy_mah'][0]) - 1) * 100:+.1f}%, "
+        f"total/hour "
+        f"{((learned_hourly[0] / no_adr_summary['total_energy_per_hour'][0]) - 1) * 100:+.1f}%"
     )
 
     print("\nContinuous lifetime:")
@@ -1462,21 +1462,8 @@ def main():
         representative_seed=EVALUATION_SEEDS[0],
     )
 
-    best_fixed = select_best_fixed_config()
-    reliable_action, reliable_results = reliability_policy(
-        EVALUATION_SEEDS,
-        EVALUATION_STEPS,
-    )
-    greedy_action, greedy_results = greedy_low_energy_policy(
-        EVALUATION_SEEDS,
-        EVALUATION_STEPS,
-    )
-    random_results = random_policy_results(
-        EVALUATION_SEEDS,
-        EVALUATION_STEPS,
-    )
-    best_fixed_results = fixed_policy(
-        best_fixed,
+    no_adr_results = fixed_policy(
+        NO_ADR_ACTION,
         EVALUATION_SEEDS,
         EVALUATION_STEPS,
     )
@@ -1484,10 +1471,7 @@ def main():
     baseline_results = {
         "Learned Expected SARSA": learned_results,
         "Standard LoRaWAN ADR-style": adr_results,
-        f"Best validated fixed {best_fixed}": best_fixed_results,
-        f"Reliability fixed {reliable_action}": reliable_results,
-        f"Greedy lowest-energy {greedy_action}": greedy_results,
-        "Random policy": random_results,
+        "LoRaWAN without ADR": no_adr_results,
     }
 
     lifetime = evaluate_continuous_lifetime(
@@ -1505,13 +1489,16 @@ def main():
     )
     display_confidence_table(baseline_results)
 
-    print("\nValidation-selected configurations:")
-    print(f"Best fixed constrained action: {best_fixed}")
-    print(f"Reliability-oriented action: {reliable_action}")
-    print(f"Greedy lowest-energy action: {greedy_action}")
+    print("\nBaseline configurations:")
     print(
         "Standard LoRaWAN ADR-style: adaptive SF/power, "
         f"fixed interval={ADR_INTERVAL}s, margin={ADR_MARGIN_DB:.1f} dB"
+    )
+    print(
+        "LoRaWAN without ADR: "
+        f"fixed SF{NO_ADR_ACTION[0]}, "
+        f"{POWER_DBM[NO_ADR_ACTION[1]]} dBm, "
+        f"interval={NO_ADR_ACTION[2]}s"
     )
 
     plot_training(histories)
