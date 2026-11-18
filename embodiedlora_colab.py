@@ -25,6 +25,13 @@ from statistics import mean, stdev
 
 import matplotlib.pyplot as plt
 
+try:
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    PLOTLY_AVAILABLE = True
+except ImportError:
+    PLOTLY_AVAILABLE = False
+
 
 SF_VALUES = (7, 8, 9, 10, 11, 12)
 POWER_VALUES = (1, 2, 3, 4, 5)
@@ -705,6 +712,75 @@ def print_summary(name, summary):
     )
 
 
+def confidence_table(baseline_results):
+    """Return policy-level 95% confidence intervals across evaluation seeds."""
+    rows = []
+    for name, results in baseline_results.items():
+        pdr_mean, pdr_sd, pdr_ci = mean_ci(
+            [row["pdr"] for row in results]
+        )
+        energy_mean, energy_sd, energy_ci = mean_ci(
+            [row["active_energy_mah"] for row in results]
+        )
+        rows.append(
+            {
+                "Policy": name,
+                "Seeds": len(results),
+                "PDR mean": pdr_mean,
+                "PDR 95% CI": pdr_ci,
+                "PDR CI lower": pdr_mean - pdr_ci,
+                "PDR CI upper": pdr_mean + pdr_ci,
+                "Active energy mean (mAh/cycle)": energy_mean,
+                "Energy 95% CI": energy_ci,
+                "Energy CI lower": energy_mean - energy_ci,
+                "Energy CI upper": energy_mean + energy_ci,
+            }
+        )
+    return rows
+
+
+def display_confidence_table(baseline_results):
+    """Display the requested PDR and energy confidence table."""
+    rows = confidence_table(baseline_results)
+    columns = (
+        "Policy",
+        "Seeds",
+        "PDR mean",
+        "PDR 95% CI",
+        "Active energy mean (mAh/cycle)",
+        "Energy 95% CI",
+    )
+    try:
+        import pandas as pd
+        from IPython.display import display
+
+        frame = pd.DataFrame(rows)[list(columns)].copy()
+        for column in columns[2:]:
+            frame[column] = frame[column].map(
+                lambda value: f"{value:.6f}"
+            )
+        display(frame)
+    except ImportError:
+        print("\n95% confidence intervals across evaluation seeds")
+        print("-" * 110)
+        print(
+            f"{'Policy':35} {'Seeds':>5} {'PDR':>10} "
+            f"{'PDR 95% CI':>19} {'Energy mAh/cycle':>18} "
+            f"{'Energy 95% CI':>19}"
+        )
+        for row in rows:
+            print(
+                f"{row['Policy'][:35]:35} "
+                f"{row['Seeds']:5d} "
+                f"{row['PDR mean']:10.4f} "
+                f"[{row['PDR CI lower']:.4f}, "
+                f"{row['PDR CI upper']:.4f}] "
+                f"{row['Active energy mean (mAh/cycle)']:18.7f} "
+                f"[{row['Energy CI lower']:.7f}, "
+                f"{row['Energy CI upper']:.7f}]"
+            )
+
+
 def print_report(
     agent,
     histories,
@@ -788,6 +864,107 @@ def print_report(
         f"{lifetime['total_energy_per_hour']:.6f} mAh/hour"
     )
     print(f"Remaining battery: {lifetime['battery']:.2f} mAh")
+
+
+def plot_baseline_comparison(baseline_results):
+    """Compare PDR and active energy for all policies with 95% CI bars."""
+    rows = confidence_table(baseline_results)
+    labels = [row["Policy"] for row in rows]
+    pdr = [row["PDR mean"] for row in rows]
+    pdr_ci = [row["PDR 95% CI"] for row in rows]
+    energy = [
+        row["Active energy mean (mAh/cycle)"]
+        for row in rows
+    ]
+    energy_ci = [row["Energy 95% CI"] for row in rows]
+
+    if PLOTLY_AVAILABLE:
+        figure = make_subplots(
+            rows=1,
+            cols=2,
+            subplot_titles=(
+                "PDR across evaluation seeds",
+                "Active energy per cycle",
+            ),
+        )
+        figure.add_trace(
+            go.Bar(
+                x=labels,
+                y=pdr,
+                error_y=dict(type="data", array=pdr_ci),
+                customdata=[
+                    [row["PDR CI lower"], row["PDR CI upper"]]
+                    for row in rows
+                ],
+                hovertemplate=(
+                    "%{x}<br>Mean PDR: %{y:.4f}"
+                    "<br>95% CI: [%{customdata[0]:.4f}, "
+                    "%{customdata[1]:.4f}]<extra></extra>"
+                ),
+                name="PDR",
+            ),
+            row=1,
+            col=1,
+        )
+        figure.add_trace(
+            go.Bar(
+                x=labels,
+                y=energy,
+                error_y=dict(type="data", array=energy_ci),
+                customdata=[
+                    [row["Energy CI lower"], row["Energy CI upper"]]
+                    for row in rows
+                ],
+                hovertemplate=(
+                    "%{x}<br>Mean energy: %{y:.7f} mAh/cycle"
+                    "<br>95% CI: [%{customdata[0]:.7f}, "
+                    "%{customdata[1]:.7f}]<extra></extra>"
+                ),
+                name="Active energy",
+            ),
+            row=1,
+            col=2,
+        )
+        figure.add_hline(
+            y=PDR_TARGET,
+            line_dash="dash",
+            annotation_text=f"PDR target {PDR_TARGET:.2f}",
+            row=1,
+            col=1,
+        )
+        figure.update_layout(
+            title="Baseline comparison with 95% confidence intervals",
+            template="plotly_white",
+            height=600,
+            showlegend=False,
+        )
+        figure.update_xaxes(tickangle=-35)
+        figure.update_yaxes(title_text="PDR", range=[0, 1.05], col=1)
+        figure.update_yaxes(
+            title_text="Active energy (mAh/cycle)",
+            col=2,
+        )
+        figure.show()
+        return
+
+    positions = range(len(labels))
+    plt.figure(figsize=(16, 6))
+    plt.subplot(1, 2, 1)
+    plt.bar(positions, pdr, yerr=pdr_ci, capsize=5)
+    plt.axhline(PDR_TARGET, linestyle="--", color="red")
+    plt.xticks(positions, labels, rotation=35, ha="right")
+    plt.ylabel("PDR")
+    plt.ylim(0, 1.05)
+    plt.title("PDR comparison")
+    plt.grid(axis="y")
+    plt.subplot(1, 2, 2)
+    plt.bar(positions, energy, yerr=energy_ci, capsize=5)
+    plt.xticks(positions, labels, rotation=35, ha="right")
+    plt.ylabel("Active energy (mAh/cycle)")
+    plt.title("Energy comparison")
+    plt.grid(axis="y")
+    plt.tight_layout()
+    plt.show()
 
 
 def plot_training(histories):
@@ -944,6 +1121,141 @@ def plot_evaluation_analysis(evaluation):
     plt.show()
 
 
+def plot_interactive_evaluation(evaluation):
+    """Interactive six-panel dashboard for one held-out evaluation seed."""
+    trace = evaluation.get("trace", [])
+    if not trace:
+        print("No representative evaluation trace is available.")
+        return
+
+    steps = [row["step"] for row in trace]
+    energy = [row["result"].active_energy_mah for row in trace]
+    snr = [row["result"].snr for row in trace]
+    sf = [row["action"][0] for row in trace]
+    power = [POWER_DBM[row["action"][1]] for row in trace]
+    intervals = [row["action"][2] for row in trace]
+    delivered = [int(row["result"].delivered) for row in trace]
+    cbr = [row["result"].cbr for row in trace]
+
+    if not PLOTLY_AVAILABLE:
+        print(
+            "Plotly is not installed; displaying the static dashboard "
+            "instead."
+        )
+        plot_evaluation_analysis(evaluation)
+        return
+
+    figure = make_subplots(
+        rows=3,
+        cols=2,
+        subplot_titles=(
+            "Active energy per cycle",
+            "Evaluation SNR and CBR",
+            "Spreading factor",
+            "Transmission power",
+            "Transmission interval",
+            "Packet delivery",
+        ),
+        vertical_spacing=0.10,
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=steps,
+            y=energy,
+            mode="lines",
+            name="Active energy",
+            hovertemplate="Step %{x}<br>%{y:.7f} mAh<extra></extra>",
+        ),
+        row=1,
+        col=1,
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=steps,
+            y=snr,
+            mode="lines+markers",
+            name="SNR (dB)",
+        ),
+        row=1,
+        col=2,
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=steps,
+            y=cbr,
+            mode="lines",
+            name="CBR",
+            yaxis="y2",
+        ),
+        row=1,
+        col=2,
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=steps,
+            y=sf,
+            mode="lines",
+            name="SF",
+        ),
+        row=2,
+        col=1,
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=steps,
+            y=power,
+            mode="lines",
+            name="Power (dBm)",
+        ),
+        row=2,
+        col=2,
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=steps,
+            y=intervals,
+            mode="lines",
+            name="Interval (s)",
+        ),
+        row=3,
+        col=1,
+    )
+    figure.add_trace(
+        go.Bar(
+            x=steps,
+            y=delivered,
+            name="Delivered",
+            hovertemplate="Step %{x}<br>%{y}<extra></extra>",
+        ),
+        row=3,
+        col=2,
+    )
+    figure.update_yaxes(title_text="mAh/cycle", row=1, col=1)
+    figure.update_yaxes(title_text="dB", row=1, col=2)
+    figure.update_yaxes(title_text="SF", tickvals=SF_VALUES, row=2, col=1)
+    figure.update_yaxes(
+        title_text="dBm",
+        tickvals=sorted(POWER_DBM.values()),
+        row=2,
+        col=2,
+    )
+    figure.update_yaxes(
+        title_text="Seconds",
+        tickvals=INTERVAL_VALUES,
+        row=3,
+        col=1,
+    )
+    figure.update_yaxes(title_text="Delivered", range=[0, 1.05], row=3, col=2)
+    figure.update_xaxes(title_text="Transmission")
+    figure.update_layout(
+        title="Interactive held-out evaluation dashboard",
+        template="plotly_white",
+        height=950,
+        hovermode="x unified",
+    )
+    figure.show()
+
+
 def plot_lifetime(lifetime):
     if not lifetime["trace"]:
         return
@@ -1032,6 +1344,7 @@ def main():
         baseline_results,
         lifetime,
     )
+    display_confidence_table(baseline_results)
 
     print("\nValidation-selected configurations:")
     print(f"Best fixed constrained action: {best_fixed}")
@@ -1040,7 +1353,9 @@ def main():
 
     plot_training(histories)
     plot_action_frequencies(agent, learned_results)
+    plot_baseline_comparison(baseline_results)
     plot_evaluation_analysis(learned_results[0])
+    plot_interactive_evaluation(learned_results[0])
     plot_lifetime(lifetime)
 
 
