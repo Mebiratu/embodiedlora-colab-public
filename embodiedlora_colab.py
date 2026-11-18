@@ -113,6 +113,8 @@ EVALUATION_SEEDS = tuple(range(1000, 1050))
 EVALUATION_STEPS = 500
 VALIDATION_SEEDS = tuple(range(900, 910))
 VALIDATION_STEPS = 200
+ADR_INTERVAL = 60
+ADR_MARGIN_DB = 10.0
 
 
 def energy_mwh(current_ma, seconds):
@@ -497,6 +499,100 @@ def fixed_policy(action, seeds, steps):
         environment = EmbodiedLoRaEnvironment(seed)
         result = run_fixed_episode(environment, action, steps)
         results.append(result)
+    return results
+
+
+def choose_adr_action(observation, previous_power=1):
+    """Choose a conservative ADR-style SF and power at a fixed interval.
+
+    This is a simulator baseline, not a complete LoRaWAN network-server ADR
+    implementation. It uses the recent measured SNR, a 10 dB link margin,
+    and keeps the transmission interval fixed because LoRaWAN ADR controls
+    data rate and TX power rather than application reporting frequency.
+    """
+    if observation.snr <= -90.0:
+        return 12, 1, ADR_INTERVAL
+
+    selected_sf = 12
+    for sf in SF_VALUES:
+        if observation.snr >= REQUIRED_SNR[sf] + ADR_MARGIN_DB:
+            selected_sf = sf
+            break
+
+    selected_power = 1
+    for power in reversed(POWER_VALUES):
+        estimated_snr = (
+            observation.snr
+            + POWER_DBM[power]
+            - POWER_DBM[previous_power]
+        )
+        if estimated_snr >= REQUIRED_SNR[selected_sf] + ADR_MARGIN_DB:
+            selected_power = power
+            break
+
+    return selected_sf, selected_power, ADR_INTERVAL
+
+
+def run_adr_episode(environment, steps, collect_trace=False):
+    """Evaluate the ADR-style baseline without learning or exploration."""
+    observation = environment.reset()
+    previous_power = 1
+    delivered = 0
+    active = 0.0
+    sleep = 0.0
+    actions = []
+    trace = []
+
+    for step in range(1, steps + 1):
+        previous_observation = observation
+        action = choose_adr_action(observation, previous_power)
+        result = environment.transmit(action)
+        observation = environment.observe()
+        previous_power = action[1]
+        delivered += int(result.delivered)
+        active += result.active_energy_mah
+        sleep += result.sleep_energy_mah
+        actions.append(action)
+
+        if collect_trace:
+            trace.append(
+                {
+                    "step": step,
+                    "time_hours": environment.elapsed_seconds / 3600.0,
+                    "observation": previous_observation,
+                    "next_observation": observation,
+                    "action": action,
+                    "result": result,
+                }
+            )
+
+    output = {
+        "pdr": delivered / steps,
+        "active_energy_mah": active / steps,
+        "sleep_energy_mah": sleep / steps,
+        "total_energy_mah": (active + sleep) / steps,
+        "battery": observation.battery,
+        "actions": actions,
+        "total_energy_per_hour": (
+            active + sleep
+        ) / max(environment.elapsed_seconds / 3600.0, 1e-12),
+    }
+    if collect_trace:
+        output["trace"] = trace
+    return output
+
+
+def adr_policy(seeds, steps, representative_seed=None):
+    results = []
+    for seed in seeds:
+        environment = EmbodiedLoRaEnvironment(seed)
+        results.append(
+            run_adr_episode(
+                environment,
+                steps,
+                collect_trace=seed == representative_seed,
+            )
+        )
     return results
 
 
@@ -886,6 +982,17 @@ def print_report(
         f"  Compared with best validated fixed: "
         f"active energy {((learned_active[0] / best_active[0]) - 1) * 100:+.1f}%, "
         f"total/hour {((learned_hourly[0] / best_hourly[0]) - 1) * 100:+.1f}%"
+    )
+    adr_summary = aggregate(
+        baseline_results["Standard LoRaWAN ADR-style"]
+    )
+    print(
+        f"  Compared with Standard LoRaWAN ADR-style: "
+        f"PDR {learned_pdr[0] - adr_summary['pdr'][0]:+.3f}, "
+        f"active energy "
+        f"{((learned_active[0] / adr_summary['active_energy_mah'][0]) - 1) * 100:+.1f}%, "
+        f"total/hour "
+        f"{((learned_hourly[0] / adr_summary['total_energy_per_hour'][0]) - 1) * 100:+.1f}%"
     )
 
     print("\nContinuous lifetime:")
@@ -1349,6 +1456,11 @@ def main():
         EVALUATION_STEPS,
         representative_seed=EVALUATION_SEEDS[0],
     )
+    adr_results = adr_policy(
+        EVALUATION_SEEDS,
+        EVALUATION_STEPS,
+        representative_seed=EVALUATION_SEEDS[0],
+    )
 
     best_fixed = select_best_fixed_config()
     reliable_action, reliable_results = reliability_policy(
@@ -1371,6 +1483,7 @@ def main():
 
     baseline_results = {
         "Learned Expected SARSA": learned_results,
+        "Standard LoRaWAN ADR-style": adr_results,
         f"Best validated fixed {best_fixed}": best_fixed_results,
         f"Reliability fixed {reliable_action}": reliable_results,
         f"Greedy lowest-energy {greedy_action}": greedy_results,
@@ -1396,6 +1509,10 @@ def main():
     print(f"Best fixed constrained action: {best_fixed}")
     print(f"Reliability-oriented action: {reliable_action}")
     print(f"Greedy lowest-energy action: {greedy_action}")
+    print(
+        "Standard LoRaWAN ADR-style: adaptive SF/power, "
+        f"fixed interval={ADR_INTERVAL}s, margin={ADR_MARGIN_DB:.1f} dB"
+    )
 
     plot_training(histories)
     plot_action_frequencies(agent, learned_results)
