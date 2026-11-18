@@ -19,6 +19,7 @@ results.
 """
 
 import random
+import os
 from collections import Counter, deque
 from dataclasses import dataclass
 from statistics import mean, stdev
@@ -31,6 +32,38 @@ try:
     PLOTLY_AVAILABLE = True
 except ImportError:
     PLOTLY_AVAILABLE = False
+
+PLOT_DPI = 300
+PLOT_DIRECTORY = "embodiedlora_plots"
+os.makedirs(PLOT_DIRECTORY, exist_ok=True)
+
+
+def save_matplotlib_figure(filename):
+    """Save and display a high-resolution static figure."""
+    path = os.path.join(PLOT_DIRECTORY, filename)
+    plt.gcf().savefig(
+        path,
+        dpi=PLOT_DPI,
+        bbox_inches="tight",
+        facecolor="white",
+    )
+    print(f"Saved plot: {path}")
+
+
+def save_plotly_figure(figure, filename):
+    """Save an interactive HTML plot and, if supported, a 300-DPI PNG."""
+    html_path = os.path.join(PLOT_DIRECTORY, filename + ".html")
+    figure.write_html(html_path, include_plotlyjs="cdn")
+    print(f"Saved interactive plot: {html_path}")
+    try:
+        png_path = os.path.join(PLOT_DIRECTORY, filename + ".png")
+        figure.write_image(png_path, scale=300 / 96)
+        print(f"Saved plot at 300-DPI-equivalent resolution: {png_path}")
+    except Exception as error:
+        print(
+            "PNG export requires Plotly image export support "
+            "(for example, Kaleido). Interactive HTML was saved."
+        )
 
 
 SF_VALUES = (7, 8, 9, 10, 11, 12)
@@ -944,6 +977,10 @@ def plot_baseline_comparison(baseline_results):
             title_text="Active energy (mAh/cycle)",
             col=2,
         )
+        save_plotly_figure(
+            figure,
+            "baseline_comparison_95pct_ci",
+        )
         figure.show()
         return
 
@@ -964,6 +1001,7 @@ def plot_baseline_comparison(baseline_results):
     plt.title("Energy comparison")
     plt.grid(axis="y")
     plt.tight_layout()
+    save_matplotlib_figure("baseline_comparison_95pct_ci.png")
     plt.show()
 
 
@@ -1007,6 +1045,7 @@ def plot_training(histories):
     plt.legend()
     plt.grid()
     plt.tight_layout()
+    save_matplotlib_figure("training_convergence_300dpi.png")
     plt.show()
 
 
@@ -1033,6 +1072,7 @@ def plot_action_frequencies(agent, results):
     plt.title("Most frequently selected learned actions")
     plt.grid(axis="y")
     plt.tight_layout()
+    save_matplotlib_figure("action_frequencies_300dpi.png")
     plt.show()
 
 
@@ -1118,6 +1158,7 @@ def plot_evaluation_analysis(evaluation):
     plt.grid()
 
     plt.tight_layout()
+    save_matplotlib_figure("evaluation_diagnostics_300dpi.png")
     plt.show()
 
 
@@ -1253,6 +1294,10 @@ def plot_interactive_evaluation(evaluation):
         height=950,
         hovermode="x unified",
     )
+    save_plotly_figure(
+        figure,
+        "interactive_evaluation_dashboard",
+    )
     figure.show()
 
 
@@ -1285,6 +1330,7 @@ def plot_lifetime(lifetime):
     plt.ylabel("Energy (mAh)")
     plt.grid()
     plt.tight_layout()
+    save_matplotlib_figure("continuous_lifetime_300dpi.png")
     plt.show()
 
 
