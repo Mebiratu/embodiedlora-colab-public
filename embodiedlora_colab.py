@@ -21,6 +21,7 @@ results.
 import random
 import os
 import math
+import csv
 from collections import Counter, deque
 from dataclasses import dataclass
 from statistics import mean, stdev
@@ -119,6 +120,34 @@ ADR_MARGIN_DB = 10.0
 NO_ADR_ACTION = (12, 1, 60)
 PAYLOAD_BITS = 64
 LIFETIME_SEEDS = tuple(range(3000, 3010))
+EXTENDED_STUDY_SEEDS = (7, 17, 27)
+EXTENDED_EVALUATION_SEEDS = tuple(range(1100, 1105))
+EXTENDED_EPISODES = 80
+EXTENDED_STEPS = 30
+RUN_EXTENDED_STUDIES = True
+MEASUREMENT_CSV = os.environ.get("LORAWAN_MEASUREMENTS_CSV")
+PAYLOAD_BYTES = PAYLOAD_BITS // 8
+MAX_RETRANSMISSIONS = 2
+DUTY_CYCLE_LIMIT = 0.01  # 1% sub-band duty-cycle constraint
+PATH_LOSS_DISTANCE_M = 250.0
+PATH_LOSS_EXPONENT = 2.7
+REFERENCE_DISTANCE_M = 100.0
+REFERENCE_SNR_DB = -8.0
+INTERFERENCE_STD_DB = 2.0
+RADIO_CALIBRATION = {
+    "source": (
+        "Microchip RN2483 Data Sheet DS50002346B, Table 2-1; "
+        "replace assumptions with bench measurements"
+    ),
+    "url": (
+        "https://www.microchip.com/content/dam/mchp/documents/"
+        "OTH/ProductDocuments/DataSheets/RN2483-Data-Sheet-DS50002346E.pdf"
+    ),
+    "voltage_v": VOLTAGE_V,
+    "tx_current_ma": TX_CURRENT_MA,
+    "rx_current_ma": RX_CURRENT_MA,
+    "sleep_current_ma": SLEEP_CURRENT_MA,
+}
 
 
 def energy_mwh(current_ma, seconds):
@@ -140,8 +169,12 @@ def summarize_episode_samples(
     airtime,
     timestamps,
     elapsed_seconds,
+    retransmissions=None,
+    duty_cycle_limited=None,
 ):
     """Create comparable per-seed metrics for every policy."""
+    retransmissions = retransmissions or [0] * len(delivered)
+    duty_cycle_limited = duty_cycle_limited or [False] * len(delivered)
     delivered_times = [
         elapsed
         for elapsed, was_delivered in zip(timestamps, delivered)
@@ -196,7 +229,14 @@ def summarize_episode_samples(
             if len(delivery_gaps) > 1
             else 0.0
         ),
-        "retransmissions": 0,
+        "retransmissions": sum(retransmissions),
+        "retransmission_rate": (
+            sum(retransmissions) / max(1, len(retransmissions))
+        ),
+        "duty_cycle_limited_fraction": (
+            sum(duty_cycle_limited)
+            / max(1, len(duty_cycle_limited))
+        ),
         "pdr_by_snr_region": {
             key: sum(values) / len(values) if values else float("nan")
             for key, values in snr_regions.items()
@@ -236,6 +276,9 @@ class Result:
     sleep_energy_mah: float
     active_energy_mwh: float
     airtime_seconds: float
+    retransmissions: int
+    duty_cycle_limited: bool
+    path_loss_db: float
 
     @property
     def total_energy_mah(self):
@@ -245,14 +288,34 @@ class Result:
 class EmbodiedLoRaEnvironment:
     """Stochastic channel and battery model without physical hardware."""
 
-    def __init__(self, seed=7):
+    def __init__(
+        self,
+        seed=7,
+        distance_m=PATH_LOSS_DISTANCE_M,
+        path_loss_exponent=PATH_LOSS_EXPONENT,
+        max_retransmissions=MAX_RETRANSMISSIONS,
+        duty_cycle_limit=DUTY_CYCLE_LIMIT,
+        payload_bytes=PAYLOAD_BYTES,
+        interference_std_db=INTERFERENCE_STD_DB,
+        external_cbr_range=(0.10, 0.75),
+    ):
         self.rng = random.Random(seed)
+        self.distance_m = distance_m
+        self.path_loss_exponent = path_loss_exponent
+        self.max_retransmissions = max_retransmissions
+        self.duty_cycle_limit = duty_cycle_limit
+        self.payload_bytes = payload_bytes
+        self.interference_std_db = interference_std_db
+        self.external_cbr_range = external_cbr_range
         self.reset()
 
     def reset(self):
         self.battery_mah = INITIAL_BATTERY_MAH
         self.elapsed_seconds = 0.0
-        self.base_snr = -8.0
+        distance_loss = 10.0 * self.path_loss_exponent * math.log10(
+            max(self.distance_m, 1.0) / REFERENCE_DISTANCE_M
+        )
+        self.base_snr = REFERENCE_SNR_DB - distance_loss
         self.cbr = 0.20
         self.step_number = 0
         self.deliveries = deque(maxlen=PDR_WINDOW)
@@ -282,7 +345,7 @@ class EmbodiedLoRaEnvironment:
         if self.step_number % 25 == 0:
             self.base_snr = self.rng.choice((-15.0, -11.0, -7.0))
 
-        external_cbr = self.rng.uniform(0.10, 0.75)
+        external_cbr = self.rng.uniform(*self.external_cbr_range)
         own_channel_load = min(0.25, 0.12 * 60.0 / interval)
         self.cbr = max(
             0.05,
@@ -299,27 +362,49 @@ class EmbodiedLoRaEnvironment:
             + POWER_DBM[power]
             - 14.0
             - 3.0 * self.cbr
-            + self.rng.uniform(-2.0, 2.0)
+            + self.rng.gauss(0.0, self.interference_std_db)
         )
         rssi = -100.0 + snr + self.rng.uniform(-3.0, 3.0)
-        delivered = snr >= REQUIRED_SNR[sf]
+        airtime_seconds = (
+            TX_SECONDS[sf] * self.payload_bytes / PAYLOAD_BYTES
+        )
+        effective_interval = max(
+            interval,
+            airtime_seconds / max(self.duty_cycle_limit, 1e-9),
+        )
+        duty_cycle_limited = effective_interval > interval
+        retransmissions = 0
+        delivered = False
+        for attempt in range(self.max_retransmissions + 1):
+            attempt_snr = snr + self.rng.gauss(0.0, 0.5)
+            if attempt_snr >= REQUIRED_SNR[sf]:
+                delivered = True
+                retransmissions = attempt
+                break
+            retransmissions = attempt + 1
 
         active_components = (
             energy_mah(SENSOR_CURRENT_MA, SENSOR_SECONDS),
             energy_mah(PROCESSING_CURRENT_MA, PROCESSING_SECONDS),
-            energy_mah(TX_CURRENT_MA[power], TX_SECONDS[sf]),
+            energy_mah(
+                TX_CURRENT_MA[power],
+                airtime_seconds * (retransmissions + 1),
+            ),
             energy_mah(RX_CURRENT_MA, RX_SECONDS if delivered else 0.05),
             energy_mah(3.0 + 8.0 * self.cbr, 0.15),
         )
         active_energy_mah = sum(active_components)
-        sleep_energy_mah = energy_mah(SLEEP_CURRENT_MA, interval)
+        sleep_energy_mah = energy_mah(
+            SLEEP_CURRENT_MA,
+            effective_interval,
+        )
         active_energy_mwh = active_energy_mah * VOLTAGE_V
 
         self.battery_mah = max(
             0.0,
             self.battery_mah - active_energy_mah - sleep_energy_mah,
         )
-        self.elapsed_seconds += interval
+        self.elapsed_seconds += effective_interval
         self.deliveries.append(int(delivered))
         self.rssis.append(rssi)
         self.snrs.append(snr)
@@ -333,7 +418,12 @@ class EmbodiedLoRaEnvironment:
             active_energy_mah=active_energy_mah,
             sleep_energy_mah=sleep_energy_mah,
             active_energy_mwh=active_energy_mwh,
-            airtime_seconds=TX_SECONDS[sf],
+            airtime_seconds=airtime_seconds * (retransmissions + 1),
+            retransmissions=retransmissions,
+            duty_cycle_limited=duty_cycle_limited,
+            path_loss_db=10.0 * self.path_loss_exponent * math.log10(
+                max(self.distance_m, 1.0) / REFERENCE_DISTANCE_M
+            ),
         )
 
 
@@ -348,6 +438,9 @@ class ExpectedSARSA:
         epsilon=0.25,
         minimum_epsilon=0.03,
         epsilon_decay=0.997,
+        state_features=("battery", "rssi", "snr", "pdr", "cbr"),
+        actions=None,
+        reward_weights=None,
     ):
         self.rng = random.Random(seed)
         self.alpha = learning_rate
@@ -355,24 +448,32 @@ class ExpectedSARSA:
         self.epsilon = epsilon
         self.minimum_epsilon = minimum_epsilon
         self.epsilon_decay = epsilon_decay
-        self.actions = [
+        self.state_features = tuple(state_features)
+        self.actions = actions or [
             (sf, power, interval)
             for sf in SF_VALUES
             for power in POWER_VALUES
             for interval in INTERVAL_VALUES
         ]
+        self.reward_weights = reward_weights or {
+            "active": ACTIVE_ENERGY_WEIGHT,
+            "lifetime": LIFETIME_ENERGY_WEIGHT,
+            "pdr": PDR_WEIGHT,
+            "congestion": CONGESTION_RELIEF_WEIGHT,
+        }
         self.q = {}
         self.update_count = 0
 
     def state(self, observation):
         """Discretize battery, RSSI, SNR, PDR, and CBR."""
-        return (
-            min(4, max(0, int(observation.battery * 5))),
-            min(3, max(0, int((observation.rssi + 120) / 15))),
-            min(3, max(0, int((observation.snr + 24) / 6))),
-            min(4, max(0, int(observation.pdr * 5))),
-            min(4, max(0, int(observation.cbr * 5))),
-        )
+        bins = {
+            "battery": min(4, max(0, int(observation.battery * 5))),
+            "rssi": min(3, max(0, int((observation.rssi + 120) / 15))),
+            "snr": min(3, max(0, int((observation.snr + 24) / 6))),
+            "pdr": min(4, max(0, int(observation.pdr * 5))),
+            "cbr": min(4, max(0, int(observation.cbr * 5))),
+        }
+        return tuple(bins[name] for name in self.state_features)
 
     def values(self, state):
         return self.q.setdefault(
@@ -430,10 +531,10 @@ class ExpectedSARSA:
             0.12 - result.own_channel_load,
         )
         return (
-            ACTIVE_ENERGY_WEIGHT * (1.0 - active_score)
-            + LIFETIME_ENERGY_WEIGHT * (1.0 - lifetime_score)
-            + PDR_WEIGHT * observation.pdr
-            + CONGESTION_RELIEF_WEIGHT * congestion_relief
+            self.reward_weights["active"] * (1.0 - active_score)
+            + self.reward_weights["lifetime"] * (1.0 - lifetime_score)
+            + self.reward_weights["pdr"] * observation.pdr
+            + self.reward_weights["congestion"] * congestion_relief
             + (0.50 if result.delivered else -FAILURE_PENALTY)
             - RELIABILITY_PENALTY * reliability_deficit
         )
@@ -484,6 +585,8 @@ def run_episode(agent, environment, steps, explore=True, collect_trace=False):
     sleep_samples = []
     airtime = []
     timestamps = []
+    retransmissions = []
+    duty_cycle_limited = []
     actions = []
     trace = []
 
@@ -511,6 +614,10 @@ def run_episode(agent, environment, steps, explore=True, collect_trace=False):
         sleep_samples.append(result.sleep_energy_mah)
         airtime.append(result.airtime_seconds)
         timestamps.append(environment.elapsed_seconds)
+        retransmissions.append(result.retransmissions)
+        duty_cycle_limited.append(result.duty_cycle_limited)
+        retransmissions.append(result.retransmissions)
+        duty_cycle_limited.append(result.duty_cycle_limited)
         actions.append(action)
         if collect_trace:
             trace.append(
@@ -546,6 +653,8 @@ def run_episode(agent, environment, steps, explore=True, collect_trace=False):
             airtime,
             timestamps,
             environment.elapsed_seconds,
+            retransmissions,
+            duty_cycle_limited,
         )
     )
     if collect_trace:
@@ -553,9 +662,18 @@ def run_episode(agent, environment, steps, explore=True, collect_trace=False):
     return output
 
 
-def train(episodes=TRAINING_EPISODES, steps=TRAINING_STEPS, seed=7):
-    environment = EmbodiedLoRaEnvironment(seed)
-    agent = ExpectedSARSA(seed)
+def train(
+    episodes=TRAINING_EPISODES,
+    steps=TRAINING_STEPS,
+    seed=7,
+    environment_kwargs=None,
+    agent_kwargs=None,
+):
+    environment = EmbodiedLoRaEnvironment(
+        seed,
+        **(environment_kwargs or {}),
+    )
+    agent = ExpectedSARSA(seed, **(agent_kwargs or {}))
     history = []
 
     for episode in range(episodes):
@@ -577,10 +695,14 @@ def evaluate_policy(
     seeds,
     steps=EVALUATION_STEPS,
     representative_seed=None,
+    environment_kwargs=None,
 ):
     results = []
     for seed in seeds:
-        environment = EmbodiedLoRaEnvironment(seed)
+        environment = EmbodiedLoRaEnvironment(
+            seed,
+            **(environment_kwargs or {}),
+        )
         result = run_episode(
             agent,
             environment,
@@ -590,6 +712,233 @@ def evaluate_policy(
         )
         results.append(result)
     return results
+
+
+def run_ablation_study():
+    """Measure the contribution of state, reward, and action components."""
+    configurations = {
+        "Full model": {},
+        "No battery state": {
+            "agent_kwargs": {
+                "state_features": ("rssi", "snr", "pdr", "cbr"),
+            },
+        },
+        "No CBR state": {
+            "agent_kwargs": {
+                "state_features": ("battery", "rssi", "snr", "pdr"),
+            },
+        },
+        "No lifetime reward": {
+            "agent_kwargs": {
+                "reward_weights": {
+                    "active": ACTIVE_ENERGY_WEIGHT,
+                    "lifetime": 0.0,
+                    "pdr": PDR_WEIGHT,
+                    "congestion": CONGESTION_RELIEF_WEIGHT,
+                },
+            },
+        },
+        "No reliability reward": {
+            "agent_kwargs": {
+                "reward_weights": {
+                    "active": ACTIVE_ENERGY_WEIGHT,
+                    "lifetime": LIFETIME_ENERGY_WEIGHT,
+                    "pdr": 0.0,
+                    "congestion": CONGESTION_RELIEF_WEIGHT,
+                },
+            },
+        },
+        "SF-only actions": {
+            "agent_kwargs": {
+                "actions": [
+                    (sf, 1, 60)
+                    for sf in SF_VALUES
+                ],
+            },
+        },
+        "Fixed SF12 actions": {
+            "agent_kwargs": {
+                "actions": [(12, power, 60) for power in POWER_VALUES],
+            },
+        },
+    }
+    output = {}
+    for name, options in configurations.items():
+        agents = [
+            train(
+                episodes=EXTENDED_EPISODES,
+                steps=EXTENDED_STEPS,
+                seed=seed,
+                agent_kwargs=options.get("agent_kwargs"),
+            )[0]
+            for seed in EXTENDED_STUDY_SEEDS
+        ]
+        results = [
+            evaluate_policy(
+                agent,
+                EXTENDED_EVALUATION_SEEDS,
+                steps=100,
+            )
+            for agent in agents
+        ]
+        output[name] = aggregate(
+            [row for agent_results in results for row in agent_results]
+        )
+    return output
+
+
+def run_sensitivity_study():
+    """Evaluate traffic, battery, payload, channel, target, and seed effects."""
+    settings = {
+        "low traffic": {"environment_kwargs": {}},
+        "high traffic": {
+            "environment_kwargs": {
+                "external_cbr_range": (0.60, 0.95),
+            },
+        },
+        "small battery": {
+            "environment_kwargs": {},
+        },
+        "large payload": {
+            "environment_kwargs": {"payload_bytes": 24},
+        },
+        "strong channel": {
+            "environment_kwargs": {"distance_m": 120.0},
+        },
+        "weak channel": {
+            "environment_kwargs": {"distance_m": 450.0},
+        },
+    }
+    output = {}
+    original_battery = INITIAL_BATTERY_MAH
+    original_payload = PAYLOAD_BITS
+    original_target = PDR_TARGET
+    try:
+        for name, options in settings.items():
+            if name == "small battery":
+                globals()["INITIAL_BATTERY_MAH"] = 250.0
+            elif name == "large payload":
+                globals()["PAYLOAD_BITS"] = 192
+            else:
+                globals()["INITIAL_BATTERY_MAH"] = original_battery
+                globals()["PAYLOAD_BITS"] = original_payload
+            agents = [
+                train(
+                    episodes=EXTENDED_EPISODES,
+                    steps=EXTENDED_STEPS,
+                    seed=seed,
+                    environment_kwargs=options["environment_kwargs"],
+                )[0]
+                for seed in EXTENDED_STUDY_SEEDS
+            ]
+            rows = [
+                row
+                for agent in agents
+                for row in evaluate_policy(
+                    agent,
+                    EXTENDED_EVALUATION_SEEDS,
+                    steps=100,
+                    environment_kwargs=options["environment_kwargs"],
+                )
+            ]
+            output[name] = aggregate(rows)
+        for target in (0.70, 0.80, 0.90):
+            globals()["PDR_TARGET"] = target
+            agent = train(
+                episodes=EXTENDED_EPISODES,
+                steps=EXTENDED_STEPS,
+                seed=EXTENDED_STUDY_SEEDS[0],
+            )[0]
+            output[f"PDR target {target:.2f}"] = aggregate(
+                evaluate_policy(
+                    agent,
+                    EXTENDED_EVALUATION_SEEDS,
+                    steps=100,
+                )
+            )
+    finally:
+        globals()["INITIAL_BATTERY_MAH"] = original_battery
+        globals()["PAYLOAD_BITS"] = original_payload
+        globals()["PDR_TARGET"] = original_target
+    return output
+
+
+def print_extended_study(name, results):
+    print(f"\n{name}:")
+    for label, summary in results.items():
+        print(
+            f"{label}: PDR={summary['pdr'][0]:.3f} "
+            f"[+/- {summary['pdr'][2]:.3f}], "
+            f"energy={summary['active_energy_mah'][0]:.6f} mAh/cycle"
+        )
+
+
+def compare_external_measurements(path, simulation_summary):
+    """Compare simulation means with a user-supplied measurement CSV.
+
+    CSV columns: policy,pdr,active_energy_mah,total_energy_per_hour.
+    """
+    if not path or not os.path.exists(path):
+        print(
+            "\nExternal measurement comparison: not run. "
+            "Provide a CSV with policy,pdr,active_energy_mah,"
+            "total_energy_per_hour."
+        )
+        return
+    print("\nExternal measurement comparison:")
+    with open(path, newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            policy = row["policy"]
+            if policy not in simulation_summary:
+                continue
+            summary = simulation_summary[policy]
+            print(
+                f"{policy}: measured PDR={row['pdr']}, "
+                f"simulated PDR={summary['pdr'][0]:.3f}; "
+                f"measured energy={row['active_energy_mah']}, "
+                f"simulated energy="
+                f"{summary['active_energy_mah'][0]:.6f} mAh/cycle"
+            )
+
+
+def save_seed_results(baseline_results, filename="evaluation_seed_results.csv"):
+    """Persist raw per-seed results for reproducible statistical analysis."""
+    path = os.path.join(PLOT_DIRECTORY, filename)
+    fields = [
+        "policy", "seed_index", "pdr", "loss_rate", "mean_snr", "mean_cbr",
+        "active_energy_mah", "total_energy_per_hour", "throughput_bps",
+        "airtime_seconds_per_cycle", "packet_jitter_seconds",
+        "retransmission_rate", "duty_cycle_limited_fraction",
+    ]
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for policy, rows in baseline_results.items():
+            for seed_index, row in enumerate(rows):
+                writer.writerow({
+                    field: row.get(field, "")
+                    for field in fields
+                    if field not in ("policy", "seed_index")
+                } | {
+                    "policy": policy,
+                    "seed_index": seed_index,
+                })
+    print(f"Saved raw seed results: {path}")
+
+
+def print_validation_protocol():
+    print("\nValidation protocol:")
+    print(f"Radio calibration source: {RADIO_CALIBRATION['source']}")
+    print(f"Datasheet URL: {RADIO_CALIBRATION['url']}")
+    print(
+        "The model includes distance-based path loss, stochastic "
+        "interference, automatic confirmed-message retransmissions, "
+        f"and a {DUTY_CYCLE_LIMIT:.1%} duty-cycle constraint."
+    )
+    print(
+        "Publication results should replace assumptions with measured "
+        "current, voltage, airtime, and packet-trace data."
+    )
 
 
 def fixed_policy(action, seeds, steps):
@@ -646,6 +995,8 @@ def run_adr_episode(environment, steps, collect_trace=False):
     sleep_samples = []
     airtime = []
     timestamps = []
+    retransmissions = []
+    duty_cycle_limited = []
     actions = []
     trace = []
 
@@ -665,6 +1016,8 @@ def run_adr_episode(environment, steps, collect_trace=False):
         sleep_samples.append(result.sleep_energy_mah)
         airtime.append(result.airtime_seconds)
         timestamps.append(environment.elapsed_seconds)
+        retransmissions.append(result.retransmissions)
+        duty_cycle_limited.append(result.duty_cycle_limited)
         actions.append(action)
 
         if collect_trace:
@@ -700,6 +1053,8 @@ def run_adr_episode(environment, steps, collect_trace=False):
             airtime,
             timestamps,
             environment.elapsed_seconds,
+            retransmissions,
+            duty_cycle_limited,
         )
     )
     if collect_trace:
@@ -745,6 +1100,8 @@ def run_fixed_episode(environment, action, steps):
     sleep_samples = []
     airtime = []
     timestamps = []
+    retransmissions = []
+    duty_cycle_limited = []
 
     for _ in range(steps):
         result = environment.transmit(action)
@@ -759,6 +1116,8 @@ def run_fixed_episode(environment, action, steps):
         sleep_samples.append(result.sleep_energy_mah)
         airtime.append(result.airtime_seconds)
         timestamps.append(environment.elapsed_seconds)
+        retransmissions.append(result.retransmissions)
+        duty_cycle_limited.append(result.duty_cycle_limited)
 
     output = {
         "pdr": delivered / steps,
@@ -781,6 +1140,8 @@ def run_fixed_episode(environment, action, steps):
             airtime,
             timestamps,
             environment.elapsed_seconds,
+            retransmissions,
+            duty_cycle_limited,
         )
     )
     return output
@@ -802,6 +1163,8 @@ def aggregate(results):
         "airtime_fraction",
         "throughput_bps",
         "packet_jitter_seconds",
+        "retransmission_rate",
+        "duty_cycle_limited_fraction",
     )
     output = {}
     for name in names:
@@ -995,6 +1358,8 @@ def evaluate_policy_lifetime(
     sleep = []
     airtime = []
     timestamps = []
+    retransmissions = []
+    duty_cycle_limited = []
     previous_power = 1
 
     while environment.elapsed_seconds < horizon:
@@ -1016,6 +1381,8 @@ def evaluate_policy_lifetime(
         sleep.append(result.sleep_energy_mah)
         airtime.append(result.airtime_seconds)
         timestamps.append(environment.elapsed_seconds)
+        retransmissions.append(result.retransmissions)
+        duty_cycle_limited.append(result.duty_cycle_limited)
         if environment.battery_mah <= 0.0:
             break
 
@@ -1029,6 +1396,8 @@ def evaluate_policy_lifetime(
         airtime,
         timestamps,
         elapsed_seconds,
+        retransmissions,
+        duty_cycle_limited,
     )
     return {
         "duration_hours": elapsed_seconds / 3600.0,
@@ -1088,29 +1457,59 @@ def print_lifetime_summary(lifetime_results):
         )
 
 
-def paired_significance(results_a, results_b):
-    """Paired mean difference and normal-approximation two-sided p-value."""
+def paired_significance(results_a, results_b, seed=991):
+    """Paired permutation p-value, effect size, and bootstrap CI."""
     differences = [
         a - b for a, b in zip(results_a, results_b)
     ]
     if len(differences) < 2:
-        return 0.0, 1.0
+        return {
+            "difference": differences[0] if differences else 0.0,
+            "p_value": 1.0,
+            "effect_size": 0.0,
+            "ci": 0.0,
+        }
     difference_mean = mean(differences)
     difference_sd = stdev(differences)
-    if difference_sd == 0.0:
-        return difference_mean, 0.0 if difference_mean else 1.0
-    t_value = difference_mean / (
-        difference_sd / math.sqrt(len(differences))
+    observed = abs(difference_mean)
+    rng = random.Random(seed)
+    exceed = 0
+    permutations = 20000
+    for _ in range(permutations):
+        signed = [
+            value if rng.random() < 0.5 else -value
+            for value in differences
+        ]
+        if abs(mean(signed)) >= observed:
+            exceed += 1
+    p_value = (exceed + 1) / (permutations + 1)
+    effect_size = (
+        difference_mean / difference_sd
+        if difference_sd else 0.0
     )
-    p_value = math.erfc(abs(t_value) / math.sqrt(2.0))
-    return difference_mean, p_value
+    bootstrap = []
+    for _ in range(5000):
+        sample = [
+            rng.choice(differences)
+            for _ in differences
+        ]
+        bootstrap.append(mean(sample))
+    bootstrap.sort()
+    lower = bootstrap[int(0.025 * len(bootstrap))]
+    upper = bootstrap[int(0.975 * len(bootstrap))]
+    return {
+        "difference": difference_mean,
+        "p_value": p_value,
+        "effect_size": effect_size,
+        "ci": (lower, upper),
+    }
 
 
 def print_significance_tests(baseline_results):
     learned = baseline_results["Learned Expected SARSA"]
     for metric in ("pdr", "active_energy_mah"):
         learned_values = [row[metric] for row in learned]
-        print(f"\nPaired significance test ({metric}, normal approximation):")
+        print(f"\nPaired significance test ({metric}, paired permutation):")
         for comparison in (
             "Standard LoRaWAN ADR-style",
             "LoRaWAN without ADR",
@@ -1118,13 +1517,17 @@ def print_significance_tests(baseline_results):
             comparison_values = [
                 row[metric] for row in baseline_results[comparison]
             ]
-            difference, p_value = paired_significance(
+            result = paired_significance(
                 learned_values,
                 comparison_values,
             )
             print(
                 f"Learned - {comparison}: "
-                f"mean difference={difference:.6f}, p={p_value:.4g}"
+                f"mean difference={result['difference']:.6f}, "
+                f"95% bootstrap CI=[{result['ci'][0]:.6f}, "
+                f"{result['ci'][1]:.6f}], "
+                f"permutation p={result['p_value']:.4g}, "
+                f"Cohen dz={result['effect_size']:.3f}"
             )
 
 
@@ -1856,11 +2259,28 @@ def main():
         EVALUATION_SEEDS,
         EVALUATION_STEPS,
     )
+    fixed_sf7_results = fixed_policy(
+        (7, 1, 60),
+        EVALUATION_SEEDS,
+        EVALUATION_STEPS,
+    )
+    fixed_sf10_results = fixed_policy(
+        (10, 1, 60),
+        EVALUATION_SEEDS,
+        EVALUATION_STEPS,
+    )
+    reliability_action, reliability_results = reliability_policy(
+        EVALUATION_SEEDS,
+        EVALUATION_STEPS,
+    )
 
     baseline_results = {
         "Learned Expected SARSA": learned_results,
         "Standard LoRaWAN ADR-style": adr_results,
         "LoRaWAN without ADR": no_adr_results,
+        "Fixed SF7, 14 dBm": fixed_sf7_results,
+        "Fixed SF10, 14 dBm": fixed_sf10_results,
+        "Reliability-first heuristic": reliability_results,
     }
 
     lifetime = evaluate_continuous_lifetime(
@@ -1885,7 +2305,25 @@ def main():
     print_operating_region_metrics(baseline_results)
     print_significance_tests(baseline_results)
     print_lifetime_summary(lifetime_results)
+    print_validation_protocol()
+    compare_external_measurements(MEASUREMENT_CSV, {
+        name: aggregate(results)
+        for name, results in baseline_results.items()
+    })
+    if RUN_EXTENDED_STUDIES:
+        print_extended_study(
+            "Ablation study",
+            run_ablation_study(),
+        )
+        print_extended_study(
+            "Sensitivity study",
+            run_sensitivity_study(),
+        )
+    print(
+        f"\nReliability-first validation action: {reliability_action}"
+    )
     display_confidence_table(baseline_results)
+    save_seed_results(baseline_results)
 
     print("\nBaseline configurations:")
     print(
