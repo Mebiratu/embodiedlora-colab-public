@@ -143,8 +143,6 @@ class Observation:
     snr: float
     pdr: float
     cbr: float
-    recent_loss: float
-    elapsed_hours: float
 
 
 @dataclass(frozen=True)
@@ -188,12 +186,6 @@ class EmbodiedLoRaEnvironment:
             snr=mean(self.snrs) if self.snrs else self.base_snr,
             pdr=mean(self.deliveries) if self.deliveries else 1.0,
             cbr=self.cbr,
-            recent_loss=(
-                1.0 - mean(self.deliveries)
-                if self.deliveries
-                else 0.0
-            ),
-            elapsed_hours=self.elapsed_seconds / 3600.0,
         )
 
     def transmit(self, action):
@@ -291,15 +283,13 @@ class ExpectedSARSA:
         self.update_count = 0
 
     def state(self, observation):
-        """Use fewer bins and recent loss instead of redundant action fields."""
+        """Discretize battery, RSSI, SNR, PDR, and CBR."""
         return (
             min(4, max(0, int(observation.battery * 5))),
             min(3, max(0, int((observation.rssi + 120) / 15))),
             min(3, max(0, int((observation.snr + 24) / 6))),
             min(4, max(0, int(observation.pdr * 5))),
             min(4, max(0, int(observation.cbr * 5))),
-            min(4, max(0, int(observation.recent_loss * 5))),
-            int(observation.elapsed_hours) % 4,
         )
 
     def values(self, state):
