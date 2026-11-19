@@ -20,6 +20,7 @@ results.
 
 import random
 import os
+import math
 from collections import Counter, deque
 from dataclasses import dataclass
 from statistics import mean, stdev
@@ -116,6 +117,8 @@ VALIDATION_STEPS = 200
 ADR_INTERVAL = 60
 ADR_MARGIN_DB = 10.0
 NO_ADR_ACTION = (12, 1, 60)
+PAYLOAD_BITS = 64
+LIFETIME_SEEDS = tuple(range(3000, 3010))
 
 
 def energy_mwh(current_ma, seconds):
@@ -126,6 +129,83 @@ def energy_mwh(current_ma, seconds):
 def energy_mah(current_ma, seconds):
     """Return battery charge consumption in mAh."""
     return current_ma * seconds / 3600.0
+
+
+def summarize_episode_samples(
+    delivered,
+    snrs,
+    cbrs,
+    active,
+    sleep,
+    airtime,
+    timestamps,
+    elapsed_seconds,
+):
+    """Create comparable per-seed metrics for every policy."""
+    delivered_times = [
+        elapsed
+        for elapsed, was_delivered in zip(timestamps, delivered)
+        if was_delivered
+    ]
+    snr_regions = {"weak": [], "medium": [], "strong": []}
+    cbr_regions = {"low": [], "medium": [], "high": []}
+    for was_delivered, snr, cbr in zip(delivered, snrs, cbrs):
+        snr_key = (
+            "weak" if snr < -18.0
+            else "medium" if snr < -12.0
+            else "strong"
+        )
+        cbr_key = (
+            "low" if cbr < 0.33
+            else "medium" if cbr < 0.66
+            else "high"
+        )
+        snr_regions[snr_key].append(int(was_delivered))
+        cbr_regions[cbr_key].append(int(was_delivered))
+    delivery_gaps = [
+        later - earlier
+        for earlier, later in zip(
+            delivered_times,
+            delivered_times[1:],
+        )
+    ]
+    return {
+        "pdr": sum(delivered) / max(1, len(delivered)),
+        "loss_rate": 1.0 - (
+            sum(delivered) / max(1, len(delivered))
+        ),
+        "loss_count": len(delivered) - sum(delivered),
+        "mean_snr": mean(snrs),
+        "mean_cbr": mean(cbrs),
+        "active_energy_mah": sum(active) / max(1, len(active)),
+        "sleep_energy_mah": sum(sleep) / max(1, len(sleep)),
+        "total_energy_mah": (
+            sum(active) + sum(sleep)
+        ) / max(1, len(active)),
+        "total_energy_per_hour": (
+            sum(active) + sum(sleep)
+        ) / max(elapsed_seconds / 3600.0, 1e-12),
+        "airtime_seconds_per_cycle": mean(airtime),
+        "airtime_fraction": sum(airtime) / max(elapsed_seconds, 1e-12),
+        "throughput_bps": (
+            sum(delivered) * PAYLOAD_BITS
+            / max(elapsed_seconds, 1e-12)
+        ),
+        "packet_jitter_seconds": (
+            stdev(delivery_gaps)
+            if len(delivery_gaps) > 1
+            else 0.0
+        ),
+        "retransmissions": 0,
+        "pdr_by_snr_region": {
+            key: sum(values) / len(values) if values else float("nan")
+            for key, values in snr_regions.items()
+        },
+        "pdr_by_cbr_region": {
+            key: sum(values) / len(values) if values else float("nan")
+            for key, values in cbr_regions.items()
+        },
+    }
 
 
 def mean_ci(values):
@@ -155,6 +235,7 @@ class Result:
     active_energy_mah: float
     sleep_energy_mah: float
     active_energy_mwh: float
+    airtime_seconds: float
 
     @property
     def total_energy_mah(self):
@@ -252,6 +333,7 @@ class EmbodiedLoRaEnvironment:
             active_energy_mah=active_energy_mah,
             sleep_energy_mah=sleep_energy_mah,
             active_energy_mwh=active_energy_mwh,
+            airtime_seconds=TX_SECONDS[sf],
         )
 
 
@@ -395,6 +477,13 @@ def run_episode(agent, environment, steps, explore=True, collect_trace=False):
     delivered = 0
     active = 0.0
     sleep = 0.0
+    delivered_samples = []
+    snrs = []
+    cbrs = []
+    active_samples = []
+    sleep_samples = []
+    airtime = []
+    timestamps = []
     actions = []
     trace = []
 
@@ -415,6 +504,13 @@ def run_episode(agent, environment, steps, explore=True, collect_trace=False):
         delivered += int(result.delivered)
         active += result.active_energy_mah
         sleep += result.sleep_energy_mah
+        delivered_samples.append(int(result.delivered))
+        snrs.append(result.snr)
+        cbrs.append(result.cbr)
+        active_samples.append(result.active_energy_mah)
+        sleep_samples.append(result.sleep_energy_mah)
+        airtime.append(result.airtime_seconds)
+        timestamps.append(environment.elapsed_seconds)
         actions.append(action)
         if collect_trace:
             trace.append(
@@ -440,6 +536,18 @@ def run_episode(agent, environment, steps, explore=True, collect_trace=False):
             active + sleep
         ) / max(environment.elapsed_seconds / 3600.0, 1e-12),
     }
+    output.update(
+        summarize_episode_samples(
+            delivered_samples,
+            snrs,
+            cbrs,
+            active_samples,
+            sleep_samples,
+            airtime,
+            timestamps,
+            environment.elapsed_seconds,
+        )
+    )
     if collect_trace:
         output["trace"] = trace
     return output
@@ -531,6 +639,13 @@ def run_adr_episode(environment, steps, collect_trace=False):
     delivered = 0
     active = 0.0
     sleep = 0.0
+    delivered_samples = []
+    snrs = []
+    cbrs = []
+    active_samples = []
+    sleep_samples = []
+    airtime = []
+    timestamps = []
     actions = []
     trace = []
 
@@ -543,6 +658,13 @@ def run_adr_episode(environment, steps, collect_trace=False):
         delivered += int(result.delivered)
         active += result.active_energy_mah
         sleep += result.sleep_energy_mah
+        delivered_samples.append(int(result.delivered))
+        snrs.append(result.snr)
+        cbrs.append(result.cbr)
+        active_samples.append(result.active_energy_mah)
+        sleep_samples.append(result.sleep_energy_mah)
+        airtime.append(result.airtime_seconds)
+        timestamps.append(environment.elapsed_seconds)
         actions.append(action)
 
         if collect_trace:
@@ -568,6 +690,18 @@ def run_adr_episode(environment, steps, collect_trace=False):
             active + sleep
         ) / max(environment.elapsed_seconds / 3600.0, 1e-12),
     }
+    output.update(
+        summarize_episode_samples(
+            delivered_samples,
+            snrs,
+            cbrs,
+            active_samples,
+            sleep_samples,
+            airtime,
+            timestamps,
+            environment.elapsed_seconds,
+        )
+    )
     if collect_trace:
         output["trace"] = trace
     return output
@@ -604,6 +738,13 @@ def run_fixed_episode(environment, action, steps):
     delivered = 0
     active = 0.0
     sleep = 0.0
+    delivered_samples = []
+    snrs = []
+    cbrs = []
+    active_samples = []
+    sleep_samples = []
+    airtime = []
+    timestamps = []
 
     for _ in range(steps):
         result = environment.transmit(action)
@@ -611,8 +752,15 @@ def run_fixed_episode(environment, action, steps):
         delivered += int(result.delivered)
         active += result.active_energy_mah
         sleep += result.sleep_energy_mah
+        delivered_samples.append(int(result.delivered))
+        snrs.append(result.snr)
+        cbrs.append(result.cbr)
+        active_samples.append(result.active_energy_mah)
+        sleep_samples.append(result.sleep_energy_mah)
+        airtime.append(result.airtime_seconds)
+        timestamps.append(environment.elapsed_seconds)
 
-    return {
+    output = {
         "pdr": delivered / steps,
         "active_energy_mah": active / steps,
         "sleep_energy_mah": sleep / steps,
@@ -623,16 +771,37 @@ def run_fixed_episode(environment, action, steps):
             active + sleep
         ) / max(environment.elapsed_seconds / 3600.0, 1e-12),
     }
+    output.update(
+        summarize_episode_samples(
+            delivered_samples,
+            snrs,
+            cbrs,
+            active_samples,
+            sleep_samples,
+            airtime,
+            timestamps,
+            environment.elapsed_seconds,
+        )
+    )
+    return output
 
 
 def aggregate(results):
     names = (
         "pdr",
+        "loss_rate",
+        "loss_count",
+        "mean_snr",
+        "mean_cbr",
         "active_energy_mah",
         "sleep_energy_mah",
         "total_energy_mah",
         "battery",
         "total_energy_per_hour",
+        "airtime_seconds_per_cycle",
+        "airtime_fraction",
+        "throughput_bps",
+        "packet_jitter_seconds",
     )
     output = {}
     for name in names:
@@ -808,6 +977,195 @@ def evaluate_continuous_lifetime(agent, duration_hours=24, seed=2007):
     }
 
 
+def evaluate_policy_lifetime(
+    policy_name,
+    agent=None,
+    fixed_action=NO_ADR_ACTION,
+    duration_hours=24,
+    seed=2007,
+):
+    """Run a continuous battery lifetime test for any compared policy."""
+    environment = EmbodiedLoRaEnvironment(seed)
+    observation = environment.reset()
+    horizon = duration_hours * 3600.0
+    delivered = []
+    snrs = []
+    cbrs = []
+    active = []
+    sleep = []
+    airtime = []
+    timestamps = []
+    previous_power = 1
+
+    while environment.elapsed_seconds < horizon:
+        if policy_name == "Learned Expected SARSA":
+            action = agent.choose(agent.state(observation), explore=False)
+        elif policy_name == "Standard LoRaWAN ADR-style":
+            action = choose_adr_action(observation, previous_power)
+        else:
+            action = fixed_action
+        if action[2] > horizon - environment.elapsed_seconds:
+            break
+        result = environment.transmit(action)
+        observation = environment.observe()
+        previous_power = action[1]
+        delivered.append(int(result.delivered))
+        snrs.append(result.snr)
+        cbrs.append(result.cbr)
+        active.append(result.active_energy_mah)
+        sleep.append(result.sleep_energy_mah)
+        airtime.append(result.airtime_seconds)
+        timestamps.append(environment.elapsed_seconds)
+        if environment.battery_mah <= 0.0:
+            break
+
+    elapsed_seconds = environment.elapsed_seconds
+    metrics = summarize_episode_samples(
+        delivered,
+        snrs,
+        cbrs,
+        active,
+        sleep,
+        airtime,
+        timestamps,
+        elapsed_seconds,
+    )
+    return {
+        "duration_hours": elapsed_seconds / 3600.0,
+        "transmissions": len(delivered),
+        "pdr": metrics["pdr"],
+        "active_energy_mah": sum(active),
+        "sleep_energy_mah": sum(sleep),
+        "total_energy_mah": sum(active) + sum(sleep),
+        "total_energy_per_hour": (
+            sum(active) + sum(sleep)
+        ) / max(elapsed_seconds / 3600.0, 1e-12),
+        "battery": environment.battery_mah,
+        "mean_snr": metrics["mean_snr"],
+        "mean_cbr": metrics["mean_cbr"],
+        "packet_jitter_seconds": metrics["packet_jitter_seconds"],
+        "retransmissions": 0,
+    }
+
+
+def evaluate_lifetime_policies(
+    agents,
+    duration_hours=24,
+    seeds=LIFETIME_SEEDS,
+):
+    """Evaluate all three policies over independent lifetime seeds."""
+    output = {}
+    for policy_name in (
+        "Learned Expected SARSA",
+        "Standard LoRaWAN ADR-style",
+        "LoRaWAN without ADR",
+    ):
+        agent = agents[-1] if policy_name == "Learned Expected SARSA" else None
+        output[policy_name] = [
+            evaluate_policy_lifetime(
+                policy_name,
+                agent=agent,
+                duration_hours=duration_hours,
+                seed=seed,
+            )
+            for seed in seeds
+        ]
+    return output
+
+
+def print_lifetime_summary(lifetime_results):
+    print("\nMulti-seed continuous lifetime (95% CI):")
+    for name, results in lifetime_results.items():
+        duration = mean_ci([row["duration_hours"] for row in results])
+        battery = mean_ci([row["battery"] for row in results])
+        hourly = mean_ci(
+            [row["total_energy_per_hour"] for row in results]
+        )
+        print(
+            f"{name}: duration={duration[0]:.2f} +/- {duration[2]:.2f} h, "
+            f"remaining battery={battery[0]:.2f} +/- {battery[2]:.2f} mAh, "
+            f"energy/hour={hourly[0]:.6f} +/- {hourly[2]:.6f} mAh"
+        )
+
+
+def paired_significance(results_a, results_b):
+    """Paired mean difference and normal-approximation two-sided p-value."""
+    differences = [
+        a - b for a, b in zip(results_a, results_b)
+    ]
+    if len(differences) < 2:
+        return 0.0, 1.0
+    difference_mean = mean(differences)
+    difference_sd = stdev(differences)
+    if difference_sd == 0.0:
+        return difference_mean, 0.0 if difference_mean else 1.0
+    t_value = difference_mean / (
+        difference_sd / math.sqrt(len(differences))
+    )
+    p_value = math.erfc(abs(t_value) / math.sqrt(2.0))
+    return difference_mean, p_value
+
+
+def print_significance_tests(baseline_results):
+    learned = baseline_results["Learned Expected SARSA"]
+    for metric in ("pdr", "active_energy_mah"):
+        learned_values = [row[metric] for row in learned]
+        print(f"\nPaired significance test ({metric}, normal approximation):")
+        for comparison in (
+            "Standard LoRaWAN ADR-style",
+            "LoRaWAN without ADR",
+        ):
+            comparison_values = [
+                row[metric] for row in baseline_results[comparison]
+            ]
+            difference, p_value = paired_significance(
+                learned_values,
+                comparison_values,
+            )
+            print(
+                f"Learned - {comparison}: "
+                f"mean difference={difference:.6f}, p={p_value:.4g}"
+            )
+
+
+def print_operating_region_metrics(baseline_results):
+    print("\nPDR by operating region:")
+    for name, results in baseline_results.items():
+        def region_mean(key, region):
+            values = [
+                row[key][region]
+                for row in results
+                if not math.isnan(row[key][region])
+            ]
+            return mean(values) if values else float("nan")
+
+        snr_regions = {
+            region: region_mean("pdr_by_snr_region", region)
+            for region in ("weak", "medium", "strong")
+        }
+        cbr_regions = {
+            region: region_mean("pdr_by_cbr_region", region)
+            for region in ("low", "medium", "high")
+        }
+        print(
+            f"{name}: SNR weak/medium/strong="
+            f"{snr_regions['weak']:.3f}/"
+            f"{snr_regions['medium']:.3f}/"
+            f"{snr_regions['strong']:.3f}; "
+            f"CBR low/medium/high="
+            f"{cbr_regions['low']:.3f}/"
+            f"{cbr_regions['medium']:.3f}/"
+            f"{cbr_regions['high']:.3f}"
+        )
+
+
+def print_learned_agent_results(agent_results):
+    print("\nIndependent evaluation of trained Expected SARSA agents:")
+    for index, results in enumerate(agent_results, start=1):
+        summary = aggregate(results)
+        print_summary(f"Learned agent {index}", summary)
+
+
 def action_frequencies(actions):
     counts = Counter(actions)
     total = max(1, len(actions))
@@ -829,6 +1187,14 @@ def print_summary(name, summary):
         f"active={active:.6f} mAh +/- {active_ci:.6f}, "
         f"total/cycle={total:.6f} mAh +/- {total_ci:.6f}, "
         f"total/hour={hourly:.6f} mAh +/- {hourly_ci:.6f}"
+    )
+    print(
+        f"  SNR={summary['mean_snr'][0]:.2f} dB, "
+        f"CBR={summary['mean_cbr'][0]:.3f}, "
+        f"loss rate={summary['loss_rate'][0]:.3f}, "
+        f"throughput={summary['throughput_bps'][0]:.3f} bit/s, "
+        f"airtime/cycle={summary['airtime_seconds_per_cycle'][0]:.3f} s, "
+        f"jitter={summary['packet_jitter_seconds'][0]:.3f} s"
     )
 
 
@@ -1099,6 +1465,31 @@ def plot_baseline_comparison(baseline_results):
     plt.grid(axis="y")
     plt.tight_layout()
     save_matplotlib_figure("baseline_comparison_95pct_ci.png")
+    plt.show()
+
+
+def plot_pdr_energy_tradeoff(baseline_results):
+    """Plot the PDR-energy Pareto trade-off with 95% confidence bars."""
+    names = list(baseline_results)
+    summaries = [aggregate(baseline_results[name]) for name in names]
+    x = [summary["active_energy_mah"][0] for summary in summaries]
+    y = [summary["pdr"][0] for summary in summaries]
+    xerr = [summary["active_energy_mah"][2] for summary in summaries]
+    yerr = [summary["pdr"][2] for summary in summaries]
+    plt.figure(figsize=(8, 6))
+    plt.errorbar(x, y, xerr=xerr, yerr=yerr, fmt="o", capsize=4)
+    for name, x_value, y_value in zip(names, x, y):
+        plt.annotate(name, (x_value, y_value), xytext=(6, 6),
+                     textcoords="offset points")
+    plt.axhline(PDR_TARGET, color="red", linestyle="--",
+                label=f"PDR target ({PDR_TARGET:.2f})")
+    plt.xlabel("Active energy (mAh/cycle)")
+    plt.ylabel("PDR")
+    plt.title("PDR-energy trade-off")
+    plt.grid()
+    plt.legend()
+    plt.tight_layout()
+    save_matplotlib_figure("pdr_energy_tradeoff_300dpi.png")
     plt.show()
 
 
@@ -1440,6 +1831,14 @@ def main():
         histories.append(history)
 
     agent = agents[-1]
+    learned_agent_results = [
+        evaluate_policy(
+            trained_agent,
+            EVALUATION_SEEDS,
+            EVALUATION_STEPS,
+        )
+        for trained_agent in agents
+    ]
     learned_results = evaluate_policy(
         agent,
         EVALUATION_SEEDS,
@@ -1469,6 +1868,11 @@ def main():
         duration_hours=24,
         seed=2007,
     )
+    lifetime_results = evaluate_lifetime_policies(
+        agents,
+        duration_hours=24,
+        seeds=LIFETIME_SEEDS,
+    )
 
     print_report(
         agent,
@@ -1477,6 +1881,10 @@ def main():
         baseline_results,
         lifetime,
     )
+    print_learned_agent_results(learned_agent_results)
+    print_operating_region_metrics(baseline_results)
+    print_significance_tests(baseline_results)
+    print_lifetime_summary(lifetime_results)
     display_confidence_table(baseline_results)
 
     print("\nBaseline configurations:")
@@ -1494,6 +1902,7 @@ def main():
     plot_training(histories)
     plot_action_frequencies(agent, learned_results)
     plot_baseline_comparison(baseline_results)
+    plot_pdr_energy_tradeoff(baseline_results)
     plot_evaluation_analysis(learned_results[0])
     plot_interactive_evaluation(learned_results[0])
     plot_lifetime(lifetime)
