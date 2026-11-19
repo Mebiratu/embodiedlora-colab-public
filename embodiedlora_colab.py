@@ -120,10 +120,10 @@ ADR_MARGIN_DB = 10.0
 NO_ADR_ACTION = (12, 1, 60)
 PAYLOAD_BITS = 64
 LIFETIME_SEEDS = tuple(range(3000, 3010))
-EXTENDED_STUDY_SEEDS = (7, 17, 27)
-EXTENDED_EVALUATION_SEEDS = tuple(range(1100, 1105))
-EXTENDED_EPISODES = 80
-EXTENDED_STEPS = 30
+EXTENDED_STUDY_SEEDS = tuple(range(7, 17))
+EXTENDED_EVALUATION_SEEDS = tuple(range(1100, 1150))
+EXTENDED_EPISODES = 600
+EXTENDED_STEPS = 60
 RUN_EXTENDED_STUDIES = True
 MEASUREMENT_CSV = os.environ.get("LORAWAN_MEASUREMENTS_CSV")
 PAYLOAD_BYTES = PAYLOAD_BITS // 8
@@ -298,6 +298,7 @@ class EmbodiedLoRaEnvironment:
         payload_bytes=PAYLOAD_BYTES,
         interference_std_db=INTERFERENCE_STD_DB,
         external_cbr_range=(0.10, 0.75),
+        initial_battery_mah=INITIAL_BATTERY_MAH,
     ):
         self.rng = random.Random(seed)
         self.distance_m = distance_m
@@ -307,10 +308,11 @@ class EmbodiedLoRaEnvironment:
         self.payload_bytes = payload_bytes
         self.interference_std_db = interference_std_db
         self.external_cbr_range = external_cbr_range
+        self.initial_battery_mah = initial_battery_mah
         self.reset()
 
     def reset(self):
-        self.battery_mah = INITIAL_BATTERY_MAH
+        self.battery_mah = self.initial_battery_mah
         self.elapsed_seconds = 0.0
         distance_loss = 10.0 * self.path_loss_exponent * math.log10(
             max(self.distance_m, 1.0) / REFERENCE_DISTANCE_M
@@ -325,7 +327,7 @@ class EmbodiedLoRaEnvironment:
 
     def observe(self):
         return Observation(
-            battery=self.battery_mah / INITIAL_BATTERY_MAH,
+            battery=self.battery_mah / self.initial_battery_mah,
             rssi=mean(self.rssis) if self.rssis else -100.0,
             snr=mean(self.snrs) if self.snrs else self.base_snr,
             pdr=mean(self.deliveries) if self.deliveries else 1.0,
@@ -777,27 +779,45 @@ def run_ablation_study():
             evaluate_policy(
                 agent,
                 EXTENDED_EVALUATION_SEEDS,
-                steps=100,
+                steps=500,
             )
             for agent in agents
         ]
-        output[name] = aggregate(
-            [row for agent_results in results for row in agent_results]
-        )
+        per_agent = []
+        for agent_results in results:
+            summary = aggregate(agent_results)
+            per_agent.append({
+                "pdr": summary["pdr"][0],
+                "active_energy_mah": summary["active_energy_mah"][0],
+            })
+        pdr_values = [row["pdr"] for row in per_agent]
+        energy_values = [row["active_energy_mah"] for row in per_agent]
+        pdr_ci = mean_ci(pdr_values)
+        energy_ci = mean_ci(energy_values)
+        output[name] = {
+            "pdr": pdr_ci,
+            "active_energy_mah": energy_ci,
+        }
     return output
 
 
 def run_sensitivity_study():
     """Evaluate traffic, battery, payload, channel, target, and seed effects."""
     settings = {
-        "low traffic": {"environment_kwargs": {}},
+        "low traffic": {
+            "environment_kwargs": {
+                "external_cbr_range": (0.05, 0.25),
+                "interference_std_db": 1.0,
+            },
+        },
         "high traffic": {
             "environment_kwargs": {
                 "external_cbr_range": (0.60, 0.95),
+                "interference_std_db": 3.5,
             },
         },
         "small battery": {
-            "environment_kwargs": {},
+            "environment_kwargs": {"initial_battery_mah": 250.0},
         },
         "large payload": {
             "environment_kwargs": {"payload_bytes": 24},
@@ -810,17 +830,13 @@ def run_sensitivity_study():
         },
     }
     output = {}
-    original_battery = INITIAL_BATTERY_MAH
     original_payload = PAYLOAD_BITS
     original_target = PDR_TARGET
     try:
         for name, options in settings.items():
-            if name == "small battery":
-                globals()["INITIAL_BATTERY_MAH"] = 250.0
-            elif name == "large payload":
+            if name == "large payload":
                 globals()["PAYLOAD_BITS"] = 192
             else:
-                globals()["INITIAL_BATTERY_MAH"] = original_battery
                 globals()["PAYLOAD_BITS"] = original_payload
             agents = [
                 train(
@@ -831,33 +847,52 @@ def run_sensitivity_study():
                 )[0]
                 for seed in EXTENDED_STUDY_SEEDS
             ]
-            rows = [
-                row
-                for agent in agents
-                for row in evaluate_policy(
+            per_agent = []
+            for agent in agents:
+                rows = evaluate_policy(
                     agent,
                     EXTENDED_EVALUATION_SEEDS,
-                    steps=100,
+                    steps=500,
                     environment_kwargs=options["environment_kwargs"],
                 )
-            ]
-            output[name] = aggregate(rows)
+                summary = aggregate(rows)
+                per_agent.append({
+                    "pdr": summary["pdr"][0],
+                    "active_energy_mah": summary["active_energy_mah"][0],
+                })
+            output[name] = {
+                "pdr": mean_ci([row["pdr"] for row in per_agent]),
+                "active_energy_mah": mean_ci([
+                    row["active_energy_mah"] for row in per_agent
+                ]),
+            }
         for target in (0.70, 0.80, 0.90):
             globals()["PDR_TARGET"] = target
-            agent = train(
-                episodes=EXTENDED_EPISODES,
-                steps=EXTENDED_STEPS,
-                seed=EXTENDED_STUDY_SEEDS[0],
-            )[0]
-            output[f"PDR target {target:.2f}"] = aggregate(
-                evaluate_policy(
-                    agent,
-                    EXTENDED_EVALUATION_SEEDS,
-                    steps=100,
+            per_agent = []
+            for seed in EXTENDED_STUDY_SEEDS:
+                agent = train(
+                    episodes=EXTENDED_EPISODES,
+                    steps=EXTENDED_STEPS,
+                    seed=seed,
+                )[0]
+                summary = aggregate(
+                    evaluate_policy(
+                        agent,
+                        EXTENDED_EVALUATION_SEEDS,
+                        steps=500,
+                    )
                 )
-            )
+                per_agent.append({
+                    "pdr": summary["pdr"][0],
+                    "active_energy_mah": summary["active_energy_mah"][0],
+                })
+            output[f"PDR target {target:.2f}"] = {
+                "pdr": mean_ci([row["pdr"] for row in per_agent]),
+                "active_energy_mah": mean_ci([
+                    row["active_energy_mah"] for row in per_agent
+                ]),
+            }
     finally:
-        globals()["INITIAL_BATTERY_MAH"] = original_battery
         globals()["PAYLOAD_BITS"] = original_payload
         globals()["PDR_TARGET"] = original_target
     return output
