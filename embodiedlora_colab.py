@@ -115,6 +115,9 @@ EVALUATION_SEEDS = tuple(range(1000, 1050))
 EVALUATION_STEPS = 500
 VALIDATION_SEEDS = tuple(range(900, 910))
 VALIDATION_STEPS = 200
+CONVERGENCE_WINDOW = 100
+CONVERGENCE_SLOPE_TOLERANCE = 0.0005
+CONVERGENCE_MIN_EPISODES = 600
 ADR_INTERVAL = 60
 ADR_MARGIN_DB = 10.0
 NO_ADR_ACTION = (12, 1, 60)
@@ -457,12 +460,15 @@ class ExpectedSARSA:
             for power in POWER_VALUES
             for interval in INTERVAL_VALUES
         ]
-        self.reward_weights = reward_weights or {
+        self.reward_weights = {
             "active": ACTIVE_ENERGY_WEIGHT,
             "lifetime": LIFETIME_ENERGY_WEIGHT,
             "pdr": PDR_WEIGHT,
             "congestion": CONGESTION_RELIEF_WEIGHT,
+            "reliability": RELIABILITY_PENALTY,
         }
+        if reward_weights:
+            self.reward_weights.update(reward_weights)
         self.q = {}
         self.update_count = 0
 
@@ -538,7 +544,7 @@ class ExpectedSARSA:
             + self.reward_weights["pdr"] * observation.pdr
             + self.reward_weights["congestion"] * congestion_relief
             + (0.50 if result.delivered else -FAILURE_PENALTY)
-            - RELIABILITY_PENALTY * reliability_deficit
+            - self.reward_weights["reliability"] * reliability_deficit
         )
 
     def update(self, state, action, reward, next_state):
@@ -692,6 +698,71 @@ def train(
     return agent, history
 
 
+def convergence_diagnostics(history, window=CONVERGENCE_WINDOW):
+    """Report plateau and trend diagnostics for the training trace."""
+    if len(history) < window:
+        return {
+            "converged": False,
+            "pdr_slope": float("nan"),
+            "reward_slope": float("nan"),
+            "window_pdr": mean(row["pdr"] for row in history),
+        }
+    recent = history[-window:]
+
+    def slope(key):
+        x_mean = (window - 1) / 2.0
+        y_mean = mean(row[key] for row in recent)
+        numerator = sum(
+            (index - x_mean) * (row[key] - y_mean)
+            for index, row in enumerate(recent)
+        )
+        denominator = sum(
+            (index - x_mean) ** 2 for index in range(window)
+        )
+        return numerator / denominator
+
+    pdr_slope = slope("pdr")
+    reward_slope = slope("reward")
+    return {
+        "converged": (
+            len(history) >= CONVERGENCE_MIN_EPISODES
+            and abs(pdr_slope) <= CONVERGENCE_SLOPE_TOLERANCE
+            and abs(reward_slope) <= 5 * CONVERGENCE_SLOPE_TOLERANCE
+        ),
+        "pdr_slope": pdr_slope,
+        "reward_slope": reward_slope,
+        "window_pdr": mean(row["pdr"] for row in recent),
+    }
+
+
+def select_deployment_agent(agents):
+    """Select one agent using validation only; test seeds remain untouched."""
+    validation = []
+    for index, candidate in enumerate(agents):
+        summary = aggregate(
+            evaluate_policy(
+                candidate,
+                VALIDATION_SEEDS,
+                VALIDATION_STEPS,
+            )
+        )
+        validation.append((index, summary))
+    eligible = [
+        row for row in validation
+        if row[1]["pdr"][0] >= PDR_TARGET
+    ]
+    pool = eligible or validation
+    selected_index, selected_summary = min(
+        pool,
+        key=lambda row: (
+            row[1]["active_energy_mah"][0]
+            if eligible
+            else -row[1]["pdr"][0],
+        ),
+    )
+    return selected_index, selected_summary, validation
+
+
 def evaluate_policy(
     agent,
     seeds,
@@ -764,6 +835,7 @@ def run_ablation_study():
                     "lifetime": 0.0,
                     "pdr": PDR_WEIGHT,
                     "congestion": CONGESTION_RELIEF_WEIGHT,
+                    "reliability": RELIABILITY_PENALTY,
                 },
             },
         },
@@ -774,6 +846,7 @@ def run_ablation_study():
                     "lifetime": LIFETIME_ENERGY_WEIGHT,
                     "pdr": 0.0,
                     "congestion": CONGESTION_RELIEF_WEIGHT,
+                    "reliability": 0.0,
                 },
             },
         },
@@ -810,7 +883,10 @@ def run_ablation_study():
             )
             for agent in agents
         ]
-        output[name] = aggregate_agent_results(results)
+        output[name] = {
+            **aggregate_agent_results(results),
+            "agents": results,
+        }
     return output
 
 
@@ -887,8 +963,8 @@ def run_sensitivity_study():
                         steps=EVALUATION_STEPS,
                     )
                 )
-            output[f"PDR target {target:.2f}"] = (
-                aggregate_agent_results(agent_results)
+            output[f"PDR target {target:.2f}"] = aggregate_agent_results(
+                agent_results
             )
     finally:
         globals()["PAYLOAD_BITS"] = original_payload
@@ -907,11 +983,37 @@ def print_extended_study(name, results):
         "mean of per-agent means):"
     )
     for label, summary in results.items():
+        if label.startswith("_"):
+            continue
         print(
             f"{label}: PDR={summary['pdr'][0]:.3f} "
             f"[+/- {summary['pdr'][2]:.3f}], "
             f"energy={summary['active_energy_mah'][0]:.6f} mAh/cycle"
         )
+
+
+def print_ablation_statistics(ablation_results):
+    """Report paired effect sizes against the full model across agents."""
+    full = ablation_results["Full model"]["agents"]
+    print("\nPaired ablation statistics versus Full model:")
+    for name, result in ablation_results.items():
+        if name == "Full model" or name.startswith("_"):
+            continue
+        variant = result["agents"]
+        for metric in ("pdr", "active_energy_mah"):
+            full_values = [
+                aggregate(rows)[metric][0] for rows in full
+            ]
+            variant_values = [
+                aggregate(rows)[metric][0] for rows in variant
+            ]
+            test = paired_significance(variant_values, full_values)
+            print(
+                f"{name} ({metric}): difference={test['difference']:.6f}, "
+                f"95% CI=[{test['ci'][0]:.6f}, {test['ci'][1]:.6f}], "
+                f"permutation p={test['p_value']:.4g}, "
+                f"Cohen dz={test['effect_size']:.3f}"
+            )
 
 
 def compare_external_measurements(path, simulation_summary):
@@ -1462,6 +1564,7 @@ def evaluate_lifetime_policies(
     agents,
     duration_hours=24,
     seeds=LIFETIME_SEEDS,
+    deployment_agent=None,
 ):
     """Evaluate all three policies over independent lifetime seeds."""
     output = {}
@@ -1470,7 +1573,11 @@ def evaluate_lifetime_policies(
         "Standard LoRaWAN ADR-style",
         "LoRaWAN without ADR",
     ):
-        agent = agents[-1] if policy_name == "Learned Expected SARSA" else None
+        agent = (
+            deployment_agent or agents[-1]
+            if policy_name == "Learned Expected SARSA"
+            else None
+        )
         output[policy_name] = [
             evaluate_policy_lifetime(
                 policy_name,
@@ -1718,6 +1825,7 @@ def print_report(
     baseline_results,
     lifetime,
     learned_agent_results=None,
+    selected_agent_index=None,
 ):
     print("\nCalibrated EmbodiedLoRa Expected SARSA report")
     print("==============================================")
@@ -1726,6 +1834,19 @@ def print_report(
     print(f"Evaluation transmissions/seed: {EVALUATION_STEPS}")
     print(f"Learned states, final run: {len(agent.q)}")
     print(f"PDR target: {PDR_TARGET:.2f}")
+    if selected_agent_index is not None:
+        print(
+            f"Deployment agent: {selected_agent_index + 1} "
+            "(selected on validation data only)"
+        )
+    for index, history in enumerate(histories, start=1):
+        diagnostics = convergence_diagnostics(history)
+        print(
+            f"Convergence agent {index}: "
+            f"{'PASS' if diagnostics['converged'] else 'NOT CONFIRMED'}, "
+            f"last-window PDR={diagnostics['window_pdr']:.3f}, "
+            f"PDR slope={diagnostics['pdr_slope']:.6f}"
+        )
 
     final_rewards = []
     final_pdr = []
@@ -2291,7 +2412,10 @@ def main():
         agents.append(agent)
         histories.append(history)
 
-    agent = agents[-1]
+    selected_agent_index, validation_summary, validation_results = (
+        select_deployment_agent(agents)
+    )
+    agent = agents[selected_agent_index]
     learned_agent_results = [
         evaluate_policy(
             trained_agent,
@@ -2350,6 +2474,7 @@ def main():
         agents,
         duration_hours=24,
         seeds=LIFETIME_SEEDS,
+        deployment_agent=agent,
     )
 
     print_report(
@@ -2359,6 +2484,14 @@ def main():
         baseline_results,
         lifetime,
         learned_agent_results=learned_agent_results,
+        selected_agent_index=selected_agent_index,
+    )
+    print(
+        "\nValidation-only agent selection: "
+        f"agent {selected_agent_index + 1}, "
+        f"PDR={validation_summary['pdr'][0]:.3f}, "
+        f"active energy={validation_summary['active_energy_mah'][0]:.6f} "
+        "mAh/cycle"
     )
     print_learned_agent_results(learned_agent_results)
     print_operating_region_metrics(baseline_results)
@@ -2372,8 +2505,9 @@ def main():
     if RUN_EXTENDED_STUDIES:
         print_extended_study(
             "Ablation study",
-            run_ablation_study(),
+            ablation_results := run_ablation_study(),
         )
+        print_ablation_statistics(ablation_results)
         print_extended_study(
             "Sensitivity study",
             run_sensitivity_study(),
