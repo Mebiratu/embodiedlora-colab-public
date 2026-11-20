@@ -720,7 +720,24 @@ def aggregate_agent_results(agent_results):
     """Aggregate agents consistently: first by evaluation seed, then agents."""
     summaries = [aggregate(results) for results in agent_results]
     output = {}
-    for metric in ("pdr", "active_energy_mah"):
+    for metric in (
+        "pdr",
+        "loss_rate",
+        "loss_count",
+        "mean_snr",
+        "mean_cbr",
+        "active_energy_mah",
+        "sleep_energy_mah",
+        "total_energy_mah",
+        "battery",
+        "total_energy_per_hour",
+        "airtime_seconds_per_cycle",
+        "airtime_fraction",
+        "throughput_bps",
+        "packet_jitter_seconds",
+        "retransmission_rate",
+        "duty_cycle_limited_fraction",
+    ):
         values = [summary[metric][0] for summary in summaries]
         output[metric] = mean_ci(values)
     return output
