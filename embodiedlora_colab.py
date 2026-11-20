@@ -120,10 +120,10 @@ ADR_MARGIN_DB = 10.0
 NO_ADR_ACTION = (12, 1, 60)
 PAYLOAD_BITS = 64
 LIFETIME_SEEDS = tuple(range(3000, 3010))
-EXTENDED_STUDY_SEEDS = tuple(range(7, 17))
-EXTENDED_EVALUATION_SEEDS = tuple(range(1100, 1150))
-EXTENDED_EPISODES = 600
-EXTENDED_STEPS = 60
+EXTENDED_STUDY_SEEDS = TRAINING_SEEDS
+EXTENDED_EVALUATION_SEEDS = EVALUATION_SEEDS
+EXTENDED_EPISODES = TRAINING_EPISODES
+EXTENDED_STEPS = TRAINING_STEPS
 RUN_EXTENDED_STUDIES = True
 MEASUREMENT_CSV = os.environ.get("LORAWAN_MEASUREMENTS_CSV")
 PAYLOAD_BYTES = PAYLOAD_BITS // 8
@@ -716,6 +716,16 @@ def evaluate_policy(
     return results
 
 
+def aggregate_agent_results(agent_results):
+    """Aggregate agents consistently: first by evaluation seed, then agents."""
+    summaries = [aggregate(results) for results in agent_results]
+    output = {}
+    for metric in ("pdr", "active_energy_mah"):
+        values = [summary[metric][0] for summary in summaries]
+        output[metric] = mean_ci(values)
+    return output
+
+
 def run_ablation_study():
     """Measure the contribution of state, reward, and action components."""
     configurations = {
@@ -779,25 +789,11 @@ def run_ablation_study():
             evaluate_policy(
                 agent,
                 EXTENDED_EVALUATION_SEEDS,
-                steps=500,
+                steps=EVALUATION_STEPS,
             )
             for agent in agents
         ]
-        per_agent = []
-        for agent_results in results:
-            summary = aggregate(agent_results)
-            per_agent.append({
-                "pdr": summary["pdr"][0],
-                "active_energy_mah": summary["active_energy_mah"][0],
-            })
-        pdr_values = [row["pdr"] for row in per_agent]
-        energy_values = [row["active_energy_mah"] for row in per_agent]
-        pdr_ci = mean_ci(pdr_values)
-        energy_ci = mean_ci(energy_values)
-        output[name] = {
-            "pdr": pdr_ci,
-            "active_energy_mah": energy_ci,
-        }
+        output[name] = aggregate_agent_results(results)
     return output
 
 
@@ -847,51 +843,36 @@ def run_sensitivity_study():
                 )[0]
                 for seed in EXTENDED_STUDY_SEEDS
             ]
-            per_agent = []
+            agent_results = []
             for agent in agents:
-                rows = evaluate_policy(
-                    agent,
-                    EXTENDED_EVALUATION_SEEDS,
-                    steps=500,
-                    environment_kwargs=options["environment_kwargs"],
+                agent_results.append(
+                    evaluate_policy(
+                        agent,
+                        EXTENDED_EVALUATION_SEEDS,
+                        steps=EVALUATION_STEPS,
+                        environment_kwargs=options["environment_kwargs"],
+                    )
                 )
-                summary = aggregate(rows)
-                per_agent.append({
-                    "pdr": summary["pdr"][0],
-                    "active_energy_mah": summary["active_energy_mah"][0],
-                })
-            output[name] = {
-                "pdr": mean_ci([row["pdr"] for row in per_agent]),
-                "active_energy_mah": mean_ci([
-                    row["active_energy_mah"] for row in per_agent
-                ]),
-            }
+            output[name] = aggregate_agent_results(agent_results)
         for target in (0.70, 0.80, 0.90):
             globals()["PDR_TARGET"] = target
-            per_agent = []
+            agent_results = []
             for seed in EXTENDED_STUDY_SEEDS:
                 agent = train(
                     episodes=EXTENDED_EPISODES,
                     steps=EXTENDED_STEPS,
                     seed=seed,
                 )[0]
-                summary = aggregate(
+                agent_results.append(
                     evaluate_policy(
                         agent,
                         EXTENDED_EVALUATION_SEEDS,
-                        steps=500,
+                        steps=EVALUATION_STEPS,
                     )
                 )
-                per_agent.append({
-                    "pdr": summary["pdr"][0],
-                    "active_energy_mah": summary["active_energy_mah"][0],
-                })
-            output[f"PDR target {target:.2f}"] = {
-                "pdr": mean_ci([row["pdr"] for row in per_agent]),
-                "active_energy_mah": mean_ci([
-                    row["active_energy_mah"] for row in per_agent
-                ]),
-            }
+            output[f"PDR target {target:.2f}"] = (
+                aggregate_agent_results(agent_results)
+            )
     finally:
         globals()["PAYLOAD_BITS"] = original_payload
         globals()["PDR_TARGET"] = original_target
@@ -899,7 +880,15 @@ def run_sensitivity_study():
 
 
 def print_extended_study(name, results):
-    print(f"\n{name}:")
+    print(
+        f"\n{name} "
+        f"({len(EXTENDED_STUDY_SEEDS)} agents, "
+        f"{EXTENDED_EPISODES} episodes/agent, "
+        f"{EXTENDED_STEPS} steps/episode, "
+        f"{len(EXTENDED_EVALUATION_SEEDS)} evaluation seeds, "
+        f"{EVALUATION_STEPS} transmissions/seed; "
+        "mean of per-agent means):"
+    )
     for label, summary in results.items():
         print(
             f"{label}: PDR={summary['pdr'][0]:.3f} "
@@ -1711,6 +1700,7 @@ def print_report(
     learned_results,
     baseline_results,
     lifetime,
+    learned_agent_results=None,
 ):
     print("\nCalibrated EmbodiedLoRa Expected SARSA report")
     print("==============================================")
@@ -1743,9 +1733,25 @@ def print_report(
 
     print("\nIndependent evaluation:")
     for name, results in baseline_results.items():
-        print_summary(name, aggregate(results))
+        if (
+            name == "Learned Expected SARSA"
+            and learned_agent_results is not None
+        ):
+            print_summary(
+                name,
+                {
+                    **aggregate(results),
+                    **aggregate_agent_results(learned_agent_results),
+                },
+            )
+        else:
+            print_summary(name, aggregate(results))
 
-    learned_summary = aggregate(learned_results)
+    learned_summary = (
+        aggregate_agent_results(learned_agent_results)
+        if learned_agent_results is not None
+        else aggregate(learned_results)
+    )
     adr_summary = aggregate(
         baseline_results["Standard LoRaWAN ADR-style"]
     )
@@ -2335,6 +2341,7 @@ def main():
         learned_results,
         baseline_results,
         lifetime,
+        learned_agent_results=learned_agent_results,
     )
     print_learned_agent_results(learned_agent_results)
     print_operating_region_metrics(baseline_results)
