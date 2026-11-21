@@ -110,7 +110,7 @@ CONGESTION_RELIEF_WEIGHT = 0.12
 
 TRAINING_EPISODES = 1200
 TRAINING_STEPS = 60
-TRAINING_SEEDS = (7, 17, 27)
+TRAINING_SEEDS = (7, 17, 27, 37, 47, 57, 67, 77, 87, 97)
 EVALUATION_SEEDS = tuple(range(1000, 1050))
 EVALUATION_STEPS = 500
 VALIDATION_SEEDS = tuple(range(900, 910))
@@ -373,11 +373,6 @@ class EmbodiedLoRaEnvironment:
         airtime_seconds = (
             TX_SECONDS[sf] * self.payload_bytes / PAYLOAD_BYTES
         )
-        effective_interval = max(
-            interval,
-            airtime_seconds / max(self.duty_cycle_limit, 1e-9),
-        )
-        duty_cycle_limited = effective_interval > interval
         retransmissions = 0
         delivered = False
         for attempt in range(self.max_retransmissions + 1):
@@ -388,12 +383,24 @@ class EmbodiedLoRaEnvironment:
                 break
             retransmissions = attempt + 1
 
+        total_airtime_seconds = airtime_seconds * (
+            retransmissions + 1
+        )
+        effective_interval = max(
+            interval,
+            total_airtime_seconds / max(
+                self.duty_cycle_limit,
+                1e-9,
+            ),
+        )
+        duty_cycle_limited = effective_interval > interval
+
         active_components = (
             energy_mah(SENSOR_CURRENT_MA, SENSOR_SECONDS),
             energy_mah(PROCESSING_CURRENT_MA, PROCESSING_SECONDS),
             energy_mah(
                 TX_CURRENT_MA[power],
-                airtime_seconds * (retransmissions + 1),
+                total_airtime_seconds,
             ),
             energy_mah(RX_CURRENT_MA, RX_SECONDS if delivered else 0.05),
             energy_mah(3.0 + 8.0 * self.cbr, 0.15),
@@ -624,8 +631,6 @@ def run_episode(agent, environment, steps, explore=True, collect_trace=False):
         timestamps.append(environment.elapsed_seconds)
         retransmissions.append(result.retransmissions)
         duty_cycle_limited.append(result.duty_cycle_limited)
-        retransmissions.append(result.retransmissions)
-        duty_cycle_limited.append(result.duty_cycle_limited)
         actions.append(action)
         if collect_trace:
             trace.append(
@@ -723,15 +728,23 @@ def convergence_diagnostics(history, window=CONVERGENCE_WINDOW):
 
     pdr_slope = slope("pdr")
     reward_slope = slope("reward")
+    pdr_values = [row["pdr"] for row in recent]
+    reward_values = [row["reward"] for row in recent]
+    pdr_stability = stdev(pdr_values) if len(pdr_values) > 1 else 0.0
+    reward_stability = stdev(reward_values) if len(reward_values) > 1 else 0.0
     return {
         "converged": (
             len(history) >= CONVERGENCE_MIN_EPISODES
             and abs(pdr_slope) <= CONVERGENCE_SLOPE_TOLERANCE
             and abs(reward_slope) <= 5 * CONVERGENCE_SLOPE_TOLERANCE
+            and pdr_stability <= 0.05
+            and reward_stability <= 10.0
         ),
         "pdr_slope": pdr_slope,
         "reward_slope": reward_slope,
         "window_pdr": mean(row["pdr"] for row in recent),
+        "pdr_stability_sd": pdr_stability,
+        "reward_stability_sd": reward_stability,
     }
 
 
@@ -814,6 +827,71 @@ def aggregate_agent_results(agent_results):
     return output
 
 
+def pool_learned_seed_results(agent_results):
+    """Pool the 10 agents into one mean result for each evaluation seed."""
+    if not agent_results:
+        return []
+    pooled = []
+    seed_count = min(len(results) for results in agent_results)
+    scalar_names = (
+        "pdr",
+        "loss_rate",
+        "loss_count",
+        "mean_snr",
+        "mean_cbr",
+        "active_energy_mah",
+        "sleep_energy_mah",
+        "total_energy_mah",
+        "battery",
+        "total_energy_per_hour",
+        "airtime_seconds_per_cycle",
+        "airtime_fraction",
+        "throughput_bps",
+        "packet_jitter_seconds",
+        "retransmission_rate",
+        "duty_cycle_limited_fraction",
+        "retransmissions",
+    )
+    for seed_index in range(seed_count):
+        row = {}
+        for name in scalar_names:
+            values = [
+                results[seed_index].get(name)
+                for results in agent_results
+            ]
+            values = [value for value in values if value is not None]
+            row[name] = mean(values) if values else 0.0
+        region_rows = [
+            results[seed_index]
+            for results in agent_results
+        ]
+        row["pdr_by_snr_region"] = {
+            region: mean([
+                item["pdr_by_snr_region"][region]
+                for item in region_rows
+                if not math.isnan(item["pdr_by_snr_region"][region])
+            ]) if any(
+                not math.isnan(item["pdr_by_snr_region"][region])
+                for item in region_rows
+            ) else float("nan")
+            for region in ("weak", "medium", "strong")
+        }
+        row["pdr_by_cbr_region"] = {
+            region: mean([
+                item["pdr_by_cbr_region"][region]
+                for item in region_rows
+                if not math.isnan(item["pdr_by_cbr_region"][region])
+            ]) if any(
+                not math.isnan(item["pdr_by_cbr_region"][region])
+                for item in region_rows
+            ) else float("nan")
+            for region in ("low", "medium", "high")
+        }
+        row["actions"] = agent_results[-1][seed_index]["actions"]
+        pooled.append(row)
+    return pooled
+
+
 def run_ablation_study():
     """Measure the contribution of state, reward, and action components."""
     configurations = {
@@ -893,6 +971,12 @@ def run_ablation_study():
 def run_sensitivity_study():
     """Evaluate traffic, battery, payload, channel, target, and seed effects."""
     settings = {
+        "very low traffic": {
+            "environment_kwargs": {
+                "external_cbr_range": (0.02, 0.12),
+                "interference_std_db": 0.5,
+            },
+        },
         "low traffic": {
             "environment_kwargs": {
                 "external_cbr_range": (0.05, 0.25),
@@ -905,14 +989,32 @@ def run_sensitivity_study():
                 "interference_std_db": 3.5,
             },
         },
+        "very high traffic": {
+            "environment_kwargs": {
+                "external_cbr_range": (0.75, 1.00),
+                "interference_std_db": 4.5,
+            },
+        },
         "small battery": {
             "environment_kwargs": {"initial_battery_mah": 250.0},
+        },
+        "tiny battery": {
+            "environment_kwargs": {"initial_battery_mah": 100.0},
+        },
+        "large battery": {
+            "environment_kwargs": {"initial_battery_mah": 2000.0},
+        },
+        "small payload": {
+            "environment_kwargs": {"payload_bytes": 8},
         },
         "large payload": {
             "environment_kwargs": {"payload_bytes": 24},
         },
         "strong channel": {
             "environment_kwargs": {"distance_m": 120.0},
+        },
+        "moderate channel": {
+            "environment_kwargs": {"distance_m": 250.0},
         },
         "weak channel": {
             "environment_kwargs": {"distance_m": 450.0},
@@ -923,7 +1025,9 @@ def run_sensitivity_study():
     original_target = PDR_TARGET
     try:
         for name, options in settings.items():
-            if name == "large payload":
+            if name == "small payload":
+                globals()["PAYLOAD_BITS"] = 64
+            elif name == "large payload":
                 globals()["PAYLOAD_BITS"] = 192
             else:
                 globals()["PAYLOAD_BITS"] = original_payload
@@ -947,7 +1051,7 @@ def run_sensitivity_study():
                     )
                 )
             output[name] = aggregate_agent_results(agent_results)
-        for target in (0.70, 0.80, 0.90):
+        for target in (0.60, 0.70, 0.80, 0.90, 0.95):
             globals()["PDR_TARGET"] = target
             agent_results = []
             for seed in EXTENDED_STUDY_SEEDS:
@@ -1049,9 +1153,11 @@ def save_seed_results(baseline_results, filename="evaluation_seed_results.csv"):
     path = os.path.join(PLOT_DIRECTORY, filename)
     fields = [
         "policy", "seed_index", "pdr", "loss_rate", "mean_snr", "mean_cbr",
-        "active_energy_mah", "total_energy_per_hour", "throughput_bps",
+        "loss_count", "active_energy_mah", "total_energy_mah",
+        "total_energy_per_hour", "throughput_bps",
         "airtime_seconds_per_cycle", "packet_jitter_seconds",
-        "retransmission_rate", "duty_cycle_limited_fraction",
+        "retransmissions", "retransmission_rate",
+        "duty_cycle_limited_fraction",
     ]
     with open(path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
@@ -1069,6 +1175,57 @@ def save_seed_results(baseline_results, filename="evaluation_seed_results.csv"):
     print(f"Saved raw seed results: {path}")
 
 
+def save_agent_effect_sizes(
+    ablation_results,
+    filename="agent_effect_sizes.csv",
+):
+    """Persist per-agent ablation PDR/energy values and paired effect sizes."""
+    path = os.path.join(PLOT_DIRECTORY, filename)
+    fields = [
+        "ablation",
+        "training_seed",
+        "full_pdr",
+        "variant_pdr",
+        "pdr_difference",
+        "full_active_energy",
+        "variant_active_energy",
+        "energy_difference",
+    ]
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        full = ablation_results["Full model"]["agents"]
+        for name, result in ablation_results.items():
+            if name == "Full model":
+                continue
+            for index, (full_rows, variant_rows) in enumerate(
+                zip(full, result["agents"])
+            ):
+                full_summary = aggregate(full_rows)
+                variant_summary = aggregate(variant_rows)
+                writer.writerow({
+                    "ablation": name,
+                    "training_seed": EXTENDED_STUDY_SEEDS[index],
+                    "full_pdr": full_summary["pdr"][0],
+                    "variant_pdr": variant_summary["pdr"][0],
+                    "pdr_difference": (
+                        variant_summary["pdr"][0]
+                        - full_summary["pdr"][0]
+                    ),
+                    "full_active_energy": (
+                        full_summary["active_energy_mah"][0]
+                    ),
+                    "variant_active_energy": (
+                        variant_summary["active_energy_mah"][0]
+                    ),
+                    "energy_difference": (
+                        variant_summary["active_energy_mah"][0]
+                        - full_summary["active_energy_mah"][0]
+                    ),
+                })
+    print(f"Saved per-agent effect-size data: {path}")
+
+
 def print_validation_protocol():
     print("\nValidation protocol:")
     print(f"Radio calibration source: {RADIO_CALIBRATION['source']}")
@@ -1081,6 +1238,12 @@ def print_validation_protocol():
     print(
         "Publication results should replace assumptions with measured "
         "current, voltage, airtime, and packet-trace data."
+    )
+    print(
+        "Confirmed-packet semantics: each original packet allows up to "
+        f"{MAX_RETRANSMISSIONS} retransmission attempts; PDR counts "
+        "eventual delivery, while retransmission count and air-time include "
+        "all attempts."
     )
 
 
@@ -1556,7 +1719,9 @@ def evaluate_policy_lifetime(
         "mean_snr": metrics["mean_snr"],
         "mean_cbr": metrics["mean_cbr"],
         "packet_jitter_seconds": metrics["packet_jitter_seconds"],
-        "retransmissions": 0,
+        "retransmissions": metrics["retransmissions"],
+        "retransmission_rate": metrics["retransmission_rate"],
+        "duty_cycle_limited_fraction": metrics["duty_cycle_limited_fraction"],
     }
 
 
@@ -1845,7 +2010,9 @@ def print_report(
             f"Convergence agent {index}: "
             f"{'PASS' if diagnostics['converged'] else 'NOT CONFIRMED'}, "
             f"last-window PDR={diagnostics['window_pdr']:.3f}, "
-            f"PDR slope={diagnostics['pdr_slope']:.6f}"
+            f"PDR slope={diagnostics['pdr_slope']:.6f}, "
+            f"PDR SD={diagnostics['pdr_stability_sd']:.3f}, "
+            f"reward SD={diagnostics['reward_stability_sd']:.3f}"
         )
 
     final_rewards = []
@@ -2421,14 +2588,12 @@ def main():
             trained_agent,
             EVALUATION_SEEDS,
             EVALUATION_STEPS,
+            representative_seed=EVALUATION_SEEDS[0],
         )
         for trained_agent in agents
     ]
-    learned_results = evaluate_policy(
-        agent,
-        EVALUATION_SEEDS,
-        EVALUATION_STEPS,
-        representative_seed=EVALUATION_SEEDS[0],
+    learned_results = pool_learned_seed_results(
+        learned_agent_results
     )
     adr_results = adr_policy(
         EVALUATION_SEEDS,
@@ -2508,6 +2673,7 @@ def main():
             ablation_results := run_ablation_study(),
         )
         print_ablation_statistics(ablation_results)
+        save_agent_effect_sizes(ablation_results)
         print_extended_study(
             "Sensitivity study",
             run_sensitivity_study(),
@@ -2534,8 +2700,12 @@ def main():
     plot_action_frequencies(agent, learned_results)
     plot_baseline_comparison(baseline_results)
     plot_pdr_energy_tradeoff(baseline_results)
-    plot_evaluation_analysis(learned_results[0])
-    plot_interactive_evaluation(learned_results[0])
+    plot_evaluation_analysis(
+        learned_agent_results[selected_agent_index][0]
+    )
+    plot_interactive_evaluation(
+        learned_agent_results[selected_agent_index][0]
+    )
     plot_lifetime(lifetime)
 
 
